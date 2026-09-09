@@ -1,0 +1,19 @@
+# PLACEHOLDER — fill in when implementing.
+#
+# [project]
+# name = "claude-telegram-agent"
+# version = "0.0.0"
+# requires-python = ">=3.11"
+# dependencies = [
+#   "claude-agent-sdk",
+#   "websockets",
+#   "httpx",
+#   "platformdirs",
+# ]
+#
+# [project.scripts]
+# claude-telegram-agent = "claude_telegram_agent.__main__:main"
+#
+# [build-system]
+# requires = ["hatchling"]
+# build-backend = "hatchling.build"

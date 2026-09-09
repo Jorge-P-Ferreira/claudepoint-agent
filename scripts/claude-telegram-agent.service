@@ -1,0 +1,23 @@
+# PLACEHOLDER — systemd *user* service template for the laptop daemon.
+# Install: ~/.config/systemd/user/claude-telegram-agent.service
+#          systemctl --user enable --now claude-telegram-agent
+#          loginctl enable-linger "$USER"
+#
+# [Unit]
+# Description=CLAUDEPOINT laptop agent
+# After=network-online.target
+# Wants=network-online.target
+#
+# [Service]
+# Type=simple
+# ExecStart=%h/.local/bin/claude-telegram-agent run
+# Environment=ANTHROPIC_API_KEY=
+# Restart=always
+# RestartSec=5
+#
+# [Install]
+# WantedBy=default.target
+#
+# ── macOS equivalent ──────────────────────────────────────────────────────────
+# ~/Library/LaunchAgents/com.claudepoint.agent.plist with <key>KeepAlive</key><true/>
+# and ProgramArguments = [ claude-telegram-agent, run ]; load with `launchctl load`.
