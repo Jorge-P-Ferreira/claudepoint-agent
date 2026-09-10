@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PLACEHOLDER — prints the steps, runs nothing.
+# Runs the agent in the foreground against a local broker (broker/scripts/run_local.sh
+# must already be running). Pair first if you have no config yet:
+#   claude-telegram-agent pair <code> --broker http://localhost:8000
+#
+# No ANTHROPIC_API_KEY needed — the Agent SDK uses the local `claude` CLI's own login.
 
-echo "Run the agent in the foreground against a local broker:"
-echo "  export ANTHROPIC_API_KEY=sk-ant-..."
-echo "  export CTA_BROKER_URL=ws://localhost:8000/agent/ws"
-echo "  claude-telegram-agent run"
-echo
-echo "(Pair first if you have no ~/.config/claude-telegram-agent/config.toml)"
-
-exit 0
+exec claude-telegram-agent run

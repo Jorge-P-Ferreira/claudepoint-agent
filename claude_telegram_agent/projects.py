@@ -1,26 +1,48 @@
-"""Project discovery + on-demand create/add.
+"""Project discovery. `create_project`/`add_project` land in Phase 6 (shared/commands.md)."""
 
-PLACEHOLDER — no implementation.
+from __future__ import annotations
 
-  discover(project_roots) -> [ {project_id, path, name} ]
-    * expanduser + resolve each root
-    * a "project" = a root itself, or an immediate subdir (config choice);
-      optionally filter to dirs containing .git / pyproject.toml / package.json
-    * project_id = sha1(abspath)[:16]
-  within_allowlist(path, project_roots) -> bool
-    * guards `new_session`, and both operations below — the only real security
-      boundary for `create_project`/`add_project` (../../shared/commands.md)
-  create_project(name, project_roots, git_init=False) -> {project_id, path, name}
-    * mkdir under the first configured root; NotADirectoryError if a name
-      collides; `git init` when requested
-  add_project(path, project_roots) -> {project_id, path, name}
-    * register an existing dir; raises PermissionError if not within_allowlist
-"""
+import hashlib
+from pathlib import Path
 
 
-def discover(project_roots: list[str]) -> list[dict]:  # pragma: no cover - placeholder
-    raise NotImplementedError("claude_telegram_agent.projects.discover")
+def _project_id(path: Path) -> str:
+    return hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:16]
 
 
-def within_allowlist(path: str, project_roots: list[str]) -> bool:  # pragma: no cover - placeholder
-    raise NotImplementedError("claude_telegram_agent.projects.within_allowlist")
+def discover(project_roots: list[str]) -> list[dict]:
+    """Each entry in `project_roots` is a container directory (e.g. `~/projects`); its
+    immediate subdirectories are the projects, per project_id = sha1(abspath)[:16]."""
+    projects: list[dict] = []
+    seen_ids: set[str] = set()
+    for root in project_roots:
+        root_path = Path(root).expanduser().resolve()
+        if not root_path.is_dir():
+            continue
+        for entry in sorted(root_path.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            project_id = _project_id(entry)
+            if project_id in seen_ids:
+                continue
+            seen_ids.add(project_id)
+            projects.append({"project_id": project_id, "path": str(entry), "name": entry.name})
+    return projects
+
+
+def within_allowlist(path: str, project_roots: list[str]) -> bool:
+    """True if `path` resolves to somewhere under one of `project_roots`.
+
+    The only real security boundary for `new_session`/`create_project`/`add_project` —
+    resolves symlinks before comparing, so a symlink inside a root that points outside
+    it correctly fails.
+    """
+    resolved = Path(path).expanduser().resolve()
+    for root in project_roots:
+        root_path = Path(root).expanduser().resolve()
+        try:
+            resolved.relative_to(root_path)
+            return True
+        except ValueError:
+            continue
+    return False
