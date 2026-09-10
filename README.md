@@ -34,8 +34,11 @@ laptop_token     = "..."            # secret; file is chmod 600
 laptop_id        = "..."
 project_roots    = ["~/projects", "~/work/acme"]
 default_mode     = "default"        # default | plan | acceptEdits | bypassPermissions
-# ANTHROPIC_API_KEY comes from the environment, not this file
 ```
+
+The Agent SDK shells out to the local `claude` CLI and rides its existing subscription
+login — **no `ANTHROPIC_API_KEY` is needed**. Set one in the environment only if you
+deliberately want the agent's sessions billed to a separate API key instead.
 
 ## Files
 
@@ -55,8 +58,9 @@ agent/
 
 ## Dependencies
 
-`claude-agent-sdk`, `websockets`, `tomli`/`tomllib`, `platformdirs`, `httpx` (pairing).
-`ANTHROPIC_API_KEY` in the environment for the SDK.
+`claude-agent-sdk`, `websockets`, `tomllib` (stdlib on 3.11+), `platformdirs`, `httpx`
+(pairing). The SDK drives the local `claude` CLI and uses its login — see Config above;
+no API key required. Needs Python 3.11+.
 
 ## Safety
 

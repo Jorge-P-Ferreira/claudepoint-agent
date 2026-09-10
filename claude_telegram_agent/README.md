@@ -11,4 +11,7 @@
 | `permissions.py` | `can_use_tool(tool, input, ctx)` — fast path: emit `decision_request`, await `decision_answer`, return `PermissionResultAllow/Deny` (or the `AskUserQuestion` `answers` map). Slow path: a `PreToolUse` hook returning `defer` so the process can idle/exit; resume on answer. | |
 | `events.py` | Translate SDK stream messages (assistant text deltas, tool_use, tool_result, thinking, result) into `event` frames per `../../shared/events.md`. | |
 
-All modules are placeholder stubs (docstring + signatures + `NotImplementedError`).
+Phase 1 status: every module here is implemented for the walking-skeleton scope —
+`daemon.py` uses a fixed 2 s reconnect delay (the real backoff curve + resume are Phase
+3), and `permissions.py` deliberately always-allows every tool (`can_use_tool` /
+`PreToolUse` defer wiring is Phase 2). Each docstring states its phase boundary.
