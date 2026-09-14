@@ -1,11 +1,12 @@
 """ClaudeSDKClient wrapper — one per session. Mapping: ../../docs/claude-driver.md.
 
 Stays a thin wrapper around the SDK client; `session_manager.SessionManager` owns
-turn-queueing (`enqueue_prompt`), decision resolution (`resolve_decision`, Phase 2),
-and slot lifecycle (`close(keep_slot=...)`) on top of this.
+turn-queueing (`enqueue_prompt`, Phase 3), decision-answer routing
+(`permissions.register_answer` + reconnecting to resume, Phase 2), and slot lifecycle
+(`close(keep_slot=...)`) on top of this.
 
-`permissions.defer_hook`'s `PreToolUse` wiring is Phase 2 (see permissions.py) — Phase
-1 connects with no hooks, `can_use_tool` only.
+Phase 2: `connect()` takes a `PreToolUse` hook (built by `permissions.py`, which owns
+all decision classification/resume logic) instead of Phase 1's plain `can_use_tool`.
 """
 
 from __future__ import annotations
@@ -13,9 +14,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SystemMessage
-
-from . import permissions
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, SystemMessage
 
 
 class ClaudeSession:
@@ -23,12 +22,18 @@ class ClaudeSession:
         self._client: ClaudeSDKClient | None = None
         self.claude_session_id: str | None = None
 
-    async def connect(self, cwd: str, mode: str, resume: str | None = None) -> None:
+    async def connect(
+        self,
+        cwd: str,
+        mode: str,
+        resume: str | None = None,
+        pre_tool_use_hook: HookMatcher | None = None,
+    ) -> None:
         options = ClaudeAgentOptions(
             cwd=cwd,
             permission_mode=mode,  # type: ignore[arg-type]
-            can_use_tool=permissions.can_use_tool,
             resume=resume,
+            hooks={"PreToolUse": [pre_tool_use_hook]} if pre_tool_use_hook is not None else None,
         )
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()  # no initial prompt — keeps the input stream open

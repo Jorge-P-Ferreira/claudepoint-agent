@@ -1,11 +1,13 @@
 """Session lifecycle on the laptop. Model: ../../docs/session-model.md.
 
-Phase 1 scope: `new_session` and `prompt` only (matches prompt.md's walking skeleton).
-`decision_answer`/`set_mode`/`cancel`/`clear_session`/`end_session` (Phase 2/3) and
-`list_projects`/`create_project`/`add_project` (Phase 6) are added when those phases
-land — `dispatch` already routes by `data.type` so adding a handler is additive.
-`remove_project` never reaches here: the broker deregisters `projects/{id}` directly
-since it never touches the laptop filesystem.
+Phase 1: `new_session` and `prompt`. Phase 2 adds `decision_answer` — resuming a
+parked tool call, possibly after this process itself restarted while the phone hadn't
+answered yet (see `permissions.py`'s module docstring for the open question on the
+exact SDK-level resume trigger). `set_mode`/`cancel`/`clear_session`/`end_session`
+(Phase 3) and `list_projects`/`create_project`/`add_project` (Phase 6) are added when
+those phases land — `dispatch` already routes by `data.type` so adding a handler is
+additive. `remove_project` never reaches here: the broker deregisters `projects/{id}`
+directly since it never touches the laptop filesystem.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from . import events, projects
+from . import events, permissions, projects
 from .claude_session import ClaudeSession
 
 EmitFn = Callable[[str | None, dict[str, Any]], Awaitable[None]]
@@ -35,6 +37,8 @@ class SessionManager:
             await self._new_session(session_id, data)
         elif cmd_type == "prompt" and session_id:
             await self._prompt(session_id, data)
+        elif cmd_type == "decision_answer" and session_id:
+            await self._decision_answer(session_id, data)
         # other cmd types land with the phases that need them (see module docstring)
 
     async def _new_session(self, session_id: str, data: dict[str, Any]) -> None:
@@ -57,7 +61,8 @@ class SessionManager:
 
         session = ClaudeSession()
         self.sessions[session_id] = session
-        await session.connect(cwd=cwd, mode=mode)
+        hook = permissions.make_pre_tool_use_hook(self._emit, session_id)
+        await session.connect(cwd=cwd, mode=mode, pre_tool_use_hook=hook)
         asyncio.create_task(self._pump(session_id, session))
 
     async def _prompt(self, session_id: str, data: dict[str, Any]) -> None:
@@ -74,6 +79,32 @@ class SessionManager:
             )
             return
         await session.query(data["text"])
+
+    async def _decision_answer(self, session_id: str, data: dict[str, Any]) -> None:
+        """Resolve a parked `PreToolUse` defer. `permissions.register_answer` makes the
+        answer available *before* the hook can possibly re-fire, then a fresh connect
+        (with `resume=`) re-attaches to the session — whether or not it was still live
+        in `self.sessions`, unifying the "phone answered quickly" and "this process
+        restarted first" cases into one path."""
+        defer_token = data.get("defer_token", "")
+        permissions.register_answer(defer_token, data.get("answer", {}))
+
+        session = self.sessions.get(session_id)
+        if session is not None:
+            await session.disconnect()
+        else:
+            session = ClaudeSession()
+            self.sessions[session_id] = session
+            events.reset(session_id)  # fresh turn-bubble state for the resumed session
+
+        hook = permissions.make_pre_tool_use_hook(self._emit, session_id)
+        await session.connect(
+            cwd=data["cwd"],
+            mode=data.get("permission_mode", "default"),
+            resume=data.get("claude_session_id"),
+            pre_tool_use_hook=hook,
+        )
+        asyncio.create_task(self._pump(session_id, session))
 
     async def _pump(self, session_id: str, session: ClaudeSession) -> None:
         async for message in session:
