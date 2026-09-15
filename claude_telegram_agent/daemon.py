@@ -1,15 +1,30 @@
 """The `run` loop — WebSocket client to the broker. Contract:
 ../../docs/transport-protocol.md.
 
-Phase 1 scope: connect, `hello`, heartbeat, cmd dispatch + ack, answer `ping`, and a
-fixed reconnect delay. The real backoff curve (1->2->5->15->30s + jitter) and
-resume-from-restart (re-`hello` with `resumable_sessions`) land in Phase 3.
+Phase 1: connect, `hello`, heartbeat, cmd dispatch + ack, answer `ping`, and a fixed
+reconnect delay. Phase 3 (this file, now) replaces the fixed delay with a real backoff
+curve (1->2->5->15->30s + jitter, `_backoff_delay`) and adds resume-from-restart:
+
+- `SessionManager` (and its `emit` callback) is built once in `run()`, not per
+  connection attempt — a bare WebSocket reconnect (WiFi blip, broker restart) no
+  longer wipes it. `emit` reads the *current* socket through `_Connection` and drops
+  an event rather than raising if nothing's connected right now; anything actually
+  running (a live `ClaudeSession`/turn) just keeps going and resumes pushing events
+  once the socket is back — nothing about an in-progress conversation is lost on a
+  connection that never truly died.
+- Only an actual **process** restart (crash, reboot, manual relaunch) empties
+  `SessionManager.sessions` for real. `hello.data.resumable_sessions` reports exactly
+  what's alive right now, so the broker (`../../broker/app/ws_hub.py::_handle_hello`)
+  can tell "still running, nothing to do" from "gone, please resume" per session and
+  push a `new_session` cmd (with a `claude_session_id` to resume) only for the latter
+  — see `docs/session-model.md` § Resume.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import random
 import socket
 import time
 import uuid
@@ -22,7 +37,20 @@ from . import __version__, projects
 from .session_manager import SessionManager
 
 HEARTBEAT_INTERVAL_SECONDS = 20
-RECONNECT_DELAY_SECONDS = 2  # Phase 3 replaces this with the real backoff curve
+
+# 1 -> 2 -> 5 -> 15 -> 30s, then holds at 30s. Real network drops (a laptop asleep,
+# a flaky WiFi AP) can last anywhere from a second to tens of minutes; this backs off
+# quickly enough to feel responsive on a short blip without hammering the broker
+# during a long one.
+_BACKOFF_SCHEDULE = (1.0, 2.0, 5.0, 15.0, 30.0)
+
+
+def _backoff_delay(attempt: int) -> float:
+    """`attempt` is 0-indexed (0 = first retry). ±20% jitter per
+    `docs/transport-protocol.md` § Reconnect, so a whole fleet of laptops reconnecting
+    after a broker restart doesn't all retry in lockstep."""
+    base = _BACKOFF_SCHEDULE[min(attempt, len(_BACKOFF_SCHEDULE) - 1)]
+    return base * random.uniform(0.8, 1.2)
 
 
 def _frame_id() -> str:
@@ -40,16 +68,49 @@ def _envelope(kind: str, session_id: str | None, data: dict[str, Any]) -> dict[s
     }
 
 
+class _Connection:
+    """Holds the currently-live websocket, if any. `emit` closes over this (not a
+    specific `ws` object) so it keeps working correctly across reconnects — `_run_once`
+    updates `.ws` on connect and clears it in its `finally`."""
+
+    def __init__(self) -> None:
+        self.ws: ClientConnection | None = None
+
+
 async def run(config: dict[str, Any]) -> None:
-    while True:
+    project_roots = config.get("project_roots", ["."])
+    conn = _Connection()
+
+    async def emit(session_id: str | None, data: dict[str, Any]) -> None:
+        ws = conn.ws
+        if ws is None:
+            print(f"dropping event (disconnected): {data.get('type')}")
+            return
         try:
-            await _run_once(config)
+            await ws.send(json.dumps(_envelope("event", session_id, data)))
         except (websockets.exceptions.ConnectionClosed, OSError) as exc:
-            print(f"connection lost ({exc!r}) — reconnecting in {RECONNECT_DELAY_SECONDS}s")
-        await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+            print(f"failed to send event ({data.get('type')}): {exc!r}")
+
+    manager = SessionManager(project_roots, emit)
+    attempt = 0
+    try:
+        while True:
+            try:
+                await _run_once(config, manager, conn)
+                attempt = 0  # a clean exit (shouldn't normally happen) resets the backoff
+            except (websockets.exceptions.ConnectionClosed, OSError) as exc:
+                delay = _backoff_delay(attempt)
+                print(f"connection lost ({exc!r}) — retrying in {delay:.1f}s")
+                attempt += 1
+                await asyncio.sleep(delay)
+    finally:
+        # Ctrl+C, a real process shutdown, or a test simulating one (cancelling this
+        # task) — either way, don't leave any `claude` subprocess resident. See
+        # SessionManager.shutdown's docstring for why this matters for resume.
+        await manager.shutdown()
 
 
-async def _run_once(config: dict[str, Any]) -> None:
+async def _run_once(config: dict[str, Any], manager: SessionManager, conn: _Connection) -> None:
     broker_url = config["broker_url"]
     laptop_token = config["laptop_token"]
     project_roots = config.get("project_roots", ["."])
@@ -59,12 +120,8 @@ async def _run_once(config: dict[str, Any]) -> None:
         additional_headers={"Authorization": f"Bearer {laptop_token}"},
         subprotocols=[websockets.Subprotocol("cta.v1")],
     ) as ws:
+        conn.ws = ws
         seen_ids: set[str] = set()
-
-        async def emit(session_id: str | None, data: dict[str, Any]) -> None:
-            await ws.send(json.dumps(_envelope("event", session_id, data)))
-
-        manager = SessionManager(project_roots, emit)
 
         await ws.recv()  # `welcome` — nothing to act on in Phase 1
 
@@ -77,7 +134,10 @@ async def _run_once(config: dict[str, Any]) -> None:
                         "agent_version": __version__,
                         "laptop_name": socket.gethostname(),
                         "projects": projects.discover(project_roots),
-                        "resumable_sessions": [],  # Phase 3
+                        # What this process still has alive — empty on a fresh start,
+                        # everything if this is just a reconnect after a blip. See
+                        # this module's docstring / docs/session-model.md § Resume.
+                        "resumable_sessions": list(manager.sessions.keys()),
                     },
                 )
             )
@@ -94,16 +154,33 @@ async def _run_once(config: dict[str, Any]) -> None:
 
                 kind = frame.get("kind")
                 if kind == "cmd":
-                    await manager.dispatch(frame)
-                    await ws.send(
-                        json.dumps(
-                            _envelope("ack", frame.get("session_id"), {"ref": frame_id})
-                        )
-                    )
+                    await _dispatch_cmd(manager, frame, ws)
                 elif kind == "ping":
                     await ws.send(json.dumps(_envelope("heartbeat", None, {})))
         finally:
             heartbeat_task.cancel()
+            conn.ws = None
+
+
+async def _dispatch_cmd(
+    manager: SessionManager, frame: dict[str, Any], ws: ClientConnection
+) -> None:
+    session_id = frame.get("session_id")
+    try:
+        await manager.dispatch(frame)
+    except Exception as exc:  # noqa: BLE001 - isolate; one bad cmd shouldn't kill the socket
+        # A resumed session's `cwd` could be gone, permissions could have changed —
+        # anything's possible after time offline. One failure here must not crash the
+        # whole connection and orphan every *other* live session on this laptop.
+        print(f"cmd dispatch failed ({frame.get('data', {}).get('type')}): {exc!r}")
+        try:
+            await manager.emit(
+                session_id,
+                {"type": "error", "where": "dispatch", "message": str(exc), "recoverable": True},
+            )
+        except Exception:  # noqa: BLE001 - emit itself is already best-effort; never re-raise
+            pass
+    await ws.send(json.dumps(_envelope("ack", session_id, {"ref": frame.get("id")})))
 
 
 async def _heartbeat_loop(ws: ClientConnection) -> None:

@@ -207,3 +207,71 @@ async def test_clear_session_reconnects_fresh_without_resume(
     assert reset_calls == ["sess1"]
     assert live.connect_calls == [{"cwd": "/proj", "mode": "default", "resume": None}]
     assert manager.sessions["sess1"] is live  # same session_id, same object, reconnected
+
+
+async def test_new_session_with_claude_session_id_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The broker sets `claude_session_id` on `new_session` only when resuming after a
+    laptop reconnect/restart (`ws_hub.py::_handle_hello`) — `_new_session` is the same
+    handler either way, so this must reconnect with history intact rather than opening
+    blank. `_manager()`'s project root is `/root`, so `cwd` must live under it or the
+    allowlist check (unrelated to this test) rejects it first."""
+    manager = _manager()
+    created: list[_FakeClaudeSession] = []
+
+    def _factory() -> _FakeClaudeSession:
+        session = _FakeClaudeSession()
+        created.append(session)
+        return session
+
+    monkeypatch.setattr(session_manager, "ClaudeSession", _factory)
+
+    await manager.dispatch(
+        {
+            "session_id": "sess-resumed",
+            "data": {
+                "type": "new_session",
+                "cwd": "/root/proj",
+                "permission_mode": "plan",
+                "claude_session_id": "claude-old",
+            },
+        }
+    )
+
+    assert created[0].connect_calls == [
+        {"cwd": "/root/proj", "mode": "plan", "resume": "claude-old"}
+    ]
+    assert manager.sessions["sess-resumed"] is created[0]
+
+
+async def test_new_session_without_claude_session_id_does_not_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normal `/new` never sets `claude_session_id` — must not accidentally resume."""
+    manager = _manager()
+    created: list[_FakeClaudeSession] = []
+
+    def _factory() -> _FakeClaudeSession:
+        session = _FakeClaudeSession()
+        created.append(session)
+        return session
+
+    monkeypatch.setattr(session_manager, "ClaudeSession", _factory)
+
+    await manager.dispatch(
+        {"session_id": "sess-fresh", "data": {"type": "new_session", "cwd": "/root/proj"}}
+    )
+
+    assert created[0].connect_calls == [{"cwd": "/root/proj", "mode": "default", "resume": None}]
+
+
+async def test_shutdown_disconnects_every_live_session_and_clears_the_dict() -> None:
+    manager = _manager()
+    live1, live2 = _FakeClaudeSession(), _FakeClaudeSession()
+    manager.sessions["sess1"] = live1  # type: ignore[assignment]
+    manager.sessions["sess2"] = live2  # type: ignore[assignment]
+
+    await manager.shutdown()
+
+    assert live1.disconnected is True
+    assert live2.disconnected is True
+    assert manager.sessions == {}
