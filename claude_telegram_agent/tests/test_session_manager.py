@@ -15,6 +15,8 @@ class _FakeClaudeSession:
     def __init__(self) -> None:
         self.connect_calls: list[dict[str, Any]] = []
         self.disconnected = False
+        self.modes_set: list[str] = []
+        self.interrupted = False
 
     async def connect(
         self, cwd: str, mode: str, resume: str | None = None, pre_tool_use_hook: Any = None
@@ -23,6 +25,12 @@ class _FakeClaudeSession:
 
     async def disconnect(self) -> None:
         self.disconnected = True
+
+    async def set_permission_mode(self, mode: str) -> None:
+        self.modes_set.append(mode)
+
+    async def interrupt(self) -> None:
+        self.interrupted = True
 
     def __aiter__(self):
         async def _empty():
@@ -118,3 +126,84 @@ async def test_dispatch_routes_decision_answer_by_type(monkeypatch: pytest.Monke
     )
 
     assert called == [("sess3", {"type": "decision_answer", "answer": {"kind": "permission"}})]
+
+
+async def test_set_mode_dispatches_to_the_live_session() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+
+    await manager.dispatch({"session_id": "sess1", "data": {"type": "set_mode", "mode": "plan"}})
+
+    assert live.modes_set == ["plan"]
+
+
+async def test_set_mode_with_no_active_session_emits_an_error() -> None:
+    manager = _manager()
+    emitted: list[tuple[str | None, dict]] = []
+
+    async def _capture(session_id, data):
+        emitted.append((session_id, data))
+
+    manager._emit = _capture  # type: ignore[assignment]
+
+    await manager.dispatch({"session_id": "sess1", "data": {"type": "set_mode", "mode": "plan"}})
+
+    assert emitted == [("sess1", {"type": "error", "where": "set_mode",
+                                   "message": "no active session", "recoverable": True})]
+
+
+async def test_cancel_interrupts_the_live_session() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+
+    await manager.dispatch({"session_id": "sess1", "data": {"type": "cancel"}})
+
+    assert live.interrupted is True
+
+
+async def test_end_session_disconnects_resets_and_drops_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    reset_calls: list[str] = []
+    monkeypatch.setattr(events, "reset", lambda sid: reset_calls.append(sid))
+    emitted: list[tuple[str | None, dict]] = []
+
+    async def _capture(session_id, data):
+        emitted.append((session_id, data))
+
+    manager._emit = _capture  # type: ignore[assignment]
+
+    await manager.dispatch({"session_id": "sess1", "data": {"type": "end_session"}})
+
+    assert live.disconnected is True
+    assert "sess1" not in manager.sessions
+    assert reset_calls == ["sess1"]
+    assert emitted == [("sess1", {"type": "session_status", "status": "ended"})]
+
+
+async def test_clear_session_reconnects_fresh_without_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    reset_calls: list[str] = []
+    monkeypatch.setattr(events, "reset", lambda sid: reset_calls.append(sid))
+
+    await manager.dispatch(
+        {
+            "session_id": "sess1",
+            "data": {"type": "clear_session", "cwd": "/proj", "permission_mode": "default"},
+        }
+    )
+    await asyncio.sleep(0)
+
+    assert live.disconnected is True
+    assert reset_calls == ["sess1"]
+    assert live.connect_calls == [{"cwd": "/proj", "mode": "default", "resume": None}]
+    assert manager.sessions["sess1"] is live  # same session_id, same object, reconnected
