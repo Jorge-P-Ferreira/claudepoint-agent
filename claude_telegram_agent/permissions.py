@@ -10,9 +10,13 @@ of ours to mint.
 Three `decision_kind`s, classified by tool name: `AskUserQuestion`, `ExitPlanMode`
 (the plan-mode "I'm done, here's the plan" tool), everything else is a plain
 `permission` decision. `updatedInput` on the hook's *second* pass — once an answer is
-recorded in `_pending_answers` — lets the hook alone finish the call (no `can_use_tool`
-needed at all): same idea as `can_use_tool`'s own `updated_input`, just issued from
-`PreToolUseHookSpecificOutput` instead.
+recorded in `_pending_answers` — lets the hook alone finish the call: same idea as
+`can_use_tool`'s own `updated_input`, just issued from `PreToolUseHookSpecificOutput`
+instead. A `can_use_tool` callback (`can_use_tool` below) is still registered on every
+session, but only because headless (no-TTY) Claude Code sessions hide `AskUserQuestion`
+and `ExitPlanMode` from the tool catalog entirely unless one is present — confirmed
+empirically, not documented anywhere obvious. The `PreToolUse` hook always resolves the
+call first, so this callback should never actually run.
 
 Cross-restart resume — park now, answer arrives minutes or hours later, possibly after
 this process itself restarted — needs `session_manager.py` to put the answer into
@@ -30,7 +34,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from claude_agent_sdk import HookMatcher
+from claude_agent_sdk import HookMatcher, PermissionResultDeny
 
 EmitFn = Callable[[str | None, dict[str, Any]], Awaitable[None]]
 
@@ -49,6 +53,19 @@ _pending_answers: dict[str, dict[str, Any]] = {}
 
 def register_answer(tool_use_id: str, answer: dict[str, Any]) -> None:
     _pending_answers[tool_use_id] = answer
+
+
+async def can_use_tool(
+    _tool_name: str, _input_data: dict[str, Any], _context: Any
+) -> PermissionResultDeny:
+    """Registered on every `ClaudeAgentOptions` purely so Claude Code exposes
+    `AskUserQuestion`/`ExitPlanMode` at all — headless (no-TTY) sessions hide both
+    tools entirely unless a `can_use_tool` callback is present (confirmed empirically;
+    see `docs/claude-driver.md` § "Deferring a decision"). The `PreToolUse` hook above
+    resolves (allow/deny/defer) every tool call before the SDK would ever reach this
+    callback, so it should never actually run; it denies defensively if it somehow
+    does, rather than silently allowing something the hook didn't vet."""
+    return PermissionResultDeny(message="Unhandled by PreToolUse hook — denied defensively.")
 
 
 def make_pre_tool_use_hook(emit: EmitFn, session_id: str) -> HookMatcher:

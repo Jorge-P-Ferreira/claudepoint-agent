@@ -11,10 +11,12 @@ all decision classification/resume logic) instead of Phase 1's plain `can_use_to
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, SystemMessage
+
+CanUseToolFn = Callable[[str, dict[str, Any], Any], Awaitable[Any]]
 
 
 class ClaudeSession:
@@ -28,12 +30,17 @@ class ClaudeSession:
         mode: str,
         resume: str | None = None,
         pre_tool_use_hook: HookMatcher | None = None,
+        can_use_tool: CanUseToolFn | None = None,
     ) -> None:
         options = ClaudeAgentOptions(
             cwd=cwd,
             permission_mode=mode,  # type: ignore[arg-type]
             resume=resume,
             hooks={"PreToolUse": [pre_tool_use_hook]} if pre_tool_use_hook is not None else None,
+            # Registering this — even though the PreToolUse hook always resolves the
+            # call first — is what makes Claude Code expose AskUserQuestion/ExitPlanMode
+            # at all in a headless (no-TTY) session; see permissions.py::can_use_tool.
+            can_use_tool=can_use_tool,
         )
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()  # no initial prompt — keeps the input stream open

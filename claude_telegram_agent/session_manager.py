@@ -85,7 +85,13 @@ class SessionManager:
         session = ClaudeSession()
         self.sessions[session_id] = session
         hook = permissions.make_pre_tool_use_hook(self._emit, session_id)
-        await session.connect(cwd=cwd, mode=mode, resume=resume, pre_tool_use_hook=hook)
+        await session.connect(
+            cwd=cwd,
+            mode=mode,
+            resume=resume,
+            pre_tool_use_hook=hook,
+            can_use_tool=permissions.can_use_tool,
+        )
         asyncio.create_task(self._pump(session_id, session))
 
     async def _prompt(self, session_id: str, data: dict[str, Any]) -> None:
@@ -109,8 +115,9 @@ class SessionManager:
         (with `resume=`) re-attaches to the session — whether or not it was still live
         in `self.sessions`, unifying the "phone answered quickly" and "this process
         restarted first" cases into one path."""
+        answer = data.get("answer", {})
         defer_token = data.get("defer_token", "")
-        permissions.register_answer(defer_token, data.get("answer", {}))
+        permissions.register_answer(defer_token, answer)
 
         session = self.sessions.get(session_id)
         if session is not None:
@@ -120,12 +127,23 @@ class SessionManager:
             self.sessions[session_id] = session
             events.reset(session_id)  # fresh turn-bubble state for the resumed session
 
+        mode = data.get("permission_mode", "default")
+        if answer.get("kind") == "plan_approval" and answer.get("choice") == "approve":
+            # Per the Agent SDK's own permission-evaluation rules, `plan` mode routes
+            # every file-edit/shell-write tool through the approval callback regardless
+            # of any earlier allow — approving the `ExitPlanMode` call itself does not
+            # exit plan mode. Without switching modes here, "Approve & run" would loop
+            # Claude straight back into proposing another plan, since it can never act
+            # on the one just approved (confirmed live, 2026-09-16).
+            mode = "default"
+
         hook = permissions.make_pre_tool_use_hook(self._emit, session_id)
         await session.connect(
             cwd=data["cwd"],
-            mode=data.get("permission_mode", "default"),
+            mode=mode,
             resume=data.get("claude_session_id"),
             pre_tool_use_hook=hook,
+            can_use_tool=permissions.can_use_tool,
         )
         asyncio.create_task(self._pump(session_id, session))
 
@@ -184,6 +202,7 @@ class SessionManager:
             cwd=data["cwd"],
             mode=data.get("permission_mode", "default"),
             pre_tool_use_hook=hook,
+            can_use_tool=permissions.can_use_tool,
         )
         asyncio.create_task(self._pump(session_id, session))
 

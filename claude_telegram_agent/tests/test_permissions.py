@@ -165,6 +165,18 @@ async def test_permissive_modes_skip_ordinary_tools(mode: str) -> None:
     assert emit.calls == []
 
 
+async def test_can_use_tool_fallback_denies_defensively() -> None:
+    """Registered on every session solely to unlock `AskUserQuestion`/`ExitPlanMode` in
+    Claude Code's tool catalog (headless sessions hide both without a `can_use_tool`
+    callback present) — the `PreToolUse` hook always resolves the call first, so this
+    should never actually run in practice. If it somehow does, it must fail closed."""
+    from claude_agent_sdk import PermissionResultDeny
+
+    result = await permissions.can_use_tool("Bash", {"command": "rm -rf /"}, None)
+
+    assert isinstance(result, PermissionResultDeny)
+
+
 @pytest.mark.parametrize("mode", ["acceptEdits", "bypassPermissions"])
 async def test_permissive_modes_still_gate_ask_user_question(mode: str) -> None:
     emit = _Emitted()

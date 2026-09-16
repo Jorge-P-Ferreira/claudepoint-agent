@@ -14,14 +14,21 @@ from claude_telegram_agent import events, permissions, session_manager
 class _FakeClaudeSession:
     def __init__(self) -> None:
         self.connect_calls: list[dict[str, Any]] = []
+        self.can_use_tool_calls: list[Any] = []
         self.disconnected = False
         self.modes_set: list[str] = []
         self.interrupted = False
 
     async def connect(
-        self, cwd: str, mode: str, resume: str | None = None, pre_tool_use_hook: Any = None
+        self,
+        cwd: str,
+        mode: str,
+        resume: str | None = None,
+        pre_tool_use_hook: Any = None,
+        can_use_tool: Any = None,
     ) -> None:
         self.connect_calls.append({"cwd": cwd, "mode": mode, "resume": resume})
+        self.can_use_tool_calls.append(can_use_tool)
 
     async def disconnect(self) -> None:
         self.disconnected = True
@@ -77,6 +84,57 @@ async def test_decision_answer_resumes_a_still_live_session(
     assert manager.sessions["sess1"] is live  # same session object, just reconnected
 
 
+async def test_decision_answer_approving_a_plan_switches_out_of_plan_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per the Agent SDK docs, `plan` mode routes every file-edit/shell-write tool
+    through the approval callback regardless of any earlier allow — approving
+    `ExitPlanMode` itself doesn't exit plan mode. Confirmed live, 2026-09-16: without
+    this, "Approve & run" loops Claude back into proposing another plan forever."""
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    monkeypatch.setattr(permissions, "register_answer", lambda *_a, **_k: None)
+
+    await manager._decision_answer(
+        "sess1",
+        {
+            "defer_token": "tu1",
+            "cwd": "/proj",
+            "claude_session_id": "claude-abc",
+            "permission_mode": "plan",
+            "answer": {"kind": "plan_approval", "choice": "approve"},
+        },
+    )
+    await asyncio.sleep(0)
+
+    assert live.connect_calls == [{"cwd": "/proj", "mode": "default", "resume": "claude-abc"}]
+
+
+async def test_decision_answer_keeping_a_plan_stays_in_plan_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """"Keep planning" must not switch modes — only an actual approval does."""
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    monkeypatch.setattr(permissions, "register_answer", lambda *_a, **_k: None)
+
+    await manager._decision_answer(
+        "sess1",
+        {
+            "defer_token": "tu1",
+            "cwd": "/proj",
+            "claude_session_id": "claude-abc",
+            "permission_mode": "plan",
+            "answer": {"kind": "plan_approval", "choice": "keep", "message": "add detail"},
+        },
+    )
+    await asyncio.sleep(0)
+
+    assert live.connect_calls == [{"cwd": "/proj", "mode": "plan", "resume": "claude-abc"}]
+
+
 async def test_decision_answer_reconnects_a_dead_session(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = _manager()
     created: list[_FakeClaudeSession] = []
@@ -105,7 +163,12 @@ async def test_decision_answer_reconnects_a_dead_session(monkeypatch: pytest.Mon
 
     assert reset_calls == ["sess2"]
     assert len(created) == 1
-    assert created[0].connect_calls == [{"cwd": "/proj2", "mode": "plan", "resume": "claude-def"}]
+    # mode is "default", not the deferred "plan" — approving a plan must exit plan mode
+    # (test_decision_answer_approving_a_plan_switches_out_of_plan_mode covers this
+    # directly; this test's real subject is the dead-session reconnect path).
+    assert created[0].connect_calls == [
+        {"cwd": "/proj2", "mode": "default", "resume": "claude-def"}
+    ]
     assert manager.sessions["sess2"] is created[0]
 
 
@@ -262,6 +325,67 @@ async def test_new_session_without_claude_session_id_does_not_resume(
     )
 
     assert created[0].connect_calls == [{"cwd": "/root/proj", "mode": "default", "resume": None}]
+
+
+async def test_new_session_registers_can_use_tool_to_unlock_ask_user_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Headless Claude Code sessions hide `AskUserQuestion`/`ExitPlanMode` from the tool
+    catalog entirely unless a `can_use_tool` callback is registered (confirmed live,
+    2026-09-15 — see `docs/claude-driver.md` § "Deferring a decision"). Every
+    `session.connect()` call site must pass `permissions.can_use_tool`, even though the
+    `PreToolUse` hook always resolves the call first and this callback should never run."""
+    manager = _manager()
+    created: list[_FakeClaudeSession] = []
+
+    def _factory() -> _FakeClaudeSession:
+        session = _FakeClaudeSession()
+        created.append(session)
+        return session
+
+    monkeypatch.setattr(session_manager, "ClaudeSession", _factory)
+
+    await manager.dispatch(
+        {"session_id": "sess-new", "data": {"type": "new_session", "cwd": "/root/proj"}}
+    )
+
+    assert created[0].can_use_tool_calls == [permissions.can_use_tool]
+
+
+async def test_decision_answer_registers_can_use_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    monkeypatch.setattr(permissions, "register_answer", lambda *_a, **_k: None)
+
+    await manager._decision_answer(
+        "sess1",
+        {
+            "defer_token": "tu1",
+            "cwd": "/proj",
+            "claude_session_id": "claude-abc",
+            "answer": {"kind": "permission", "choice": "allow"},
+        },
+    )
+    await asyncio.sleep(0)
+
+    assert live.can_use_tool_calls == [permissions.can_use_tool]
+
+
+async def test_clear_session_registers_can_use_tool() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+
+    await manager.dispatch(
+        {
+            "session_id": "sess1",
+            "data": {"type": "clear_session", "cwd": "/proj", "permission_mode": "default"},
+        }
+    )
+    await asyncio.sleep(0)
+
+    assert live.can_use_tool_calls == [permissions.can_use_tool]
 
 
 async def test_shutdown_disconnects_every_live_session_and_clears_the_dict() -> None:
