@@ -101,7 +101,7 @@ async def test_emit_drops_events_while_disconnected(monkeypatch: pytest.MonkeyPa
         async def shutdown(self) -> None:
             pass
 
-    def fake_session_manager(project_roots, emit):
+    def fake_session_manager(project_roots, emit, laptop_name=""):
         captured_emit["emit"] = emit
         return _FakeManager()
 
@@ -134,7 +134,9 @@ async def test_run_shuts_down_the_manager_on_exit(monkeypatch: pytest.MonkeyPatc
             nonlocal shutdown_calls
             shutdown_calls += 1
 
-    monkeypatch.setattr(daemon, "SessionManager", lambda project_roots, emit: _FakeManager())
+    monkeypatch.setattr(
+        daemon, "SessionManager", lambda project_roots, emit, laptop_name="": _FakeManager()
+    )
 
     async def fake_run_once(config, manager, conn) -> None:
         raise SystemExit

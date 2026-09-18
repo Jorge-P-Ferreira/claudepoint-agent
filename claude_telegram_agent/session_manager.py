@@ -14,9 +14,11 @@ actually changes `claude_session_id` (`events.to_frames` → `session_status` �
 a normal `/new`) — the broker sets it when *resuming* a session after this process
 restarted (`daemon.py`'s module docstring, `docs/session-model.md` § Resume), so the
 same handler either opens a blank client or reconnects with full history depending on
-who's calling it. `list_projects`/`create_project`/`add_project` (Phase 6) are added
-when that phase lands — `dispatch` already routes by `data.type` so adding a handler
-is additive. `remove_project` never reaches here: the broker deregisters
+who's calling it. `create_project`/`add_project` (Phase 6, this file, now) are
+laptop-scoped — no `session_id` — and report back via a `project_result` event rather
+than a return value, since the broker's dispatching HTTP route returns immediately
+(`shared/data-model.md`'s "agent-side check happens before the broker ever writes the
+doc" rule). `remove_project` never reaches here: the broker deregisters
 `projects/{id}` directly since it never touches the laptop filesystem.
 """
 
@@ -33,11 +35,12 @@ EmitFn = Callable[[str | None, dict[str, Any]], Awaitable[None]]
 
 
 class SessionManager:
-    def __init__(self, project_roots: list[str], emit: EmitFn) -> None:
+    def __init__(self, project_roots: list[str], emit: EmitFn, laptop_name: str = "") -> None:
         self.sessions: dict[str, ClaudeSession] = {}
         self._project_roots = project_roots
         self._emit = emit
         self.emit = emit  # public alias — daemon.py's dispatch-failure handling uses this
+        self._laptop_name = laptop_name
 
     async def dispatch(self, frame: dict[str, Any]) -> None:
         data = frame.get("data", {})
@@ -58,6 +61,10 @@ class SessionManager:
             await self._end_session(session_id)
         elif cmd_type == "clear_session" and session_id:
             await self._clear_session(session_id, data)
+        elif cmd_type == "create_project":
+            await self._create_project(data)
+        elif cmd_type == "add_project":
+            await self._add_project(data)
         # other cmd types land with the phases that need them (see module docstring)
 
     async def _new_session(self, session_id: str, data: dict[str, Any]) -> None:
@@ -205,6 +212,60 @@ class SessionManager:
             can_use_tool=permissions.can_use_tool,
         )
         asyncio.create_task(self._pump(session_id, session))
+
+    async def _create_project(self, data: dict[str, Any]) -> None:
+        chat_id = data["chat_id"]
+        try:
+            project = projects.create_project(
+                data["name"], data.get("git_init", False), self._project_roots
+            )
+            await self._emit(
+                None,
+                {
+                    "type": "project_result",
+                    "chat_id": chat_id,
+                    "action": "create",
+                    "ok": True,
+                    **project,
+                },
+            )
+        except projects.ProjectError as exc:
+            await self._emit(
+                None,
+                {
+                    "type": "project_result",
+                    "chat_id": chat_id,
+                    "action": "create",
+                    "ok": False,
+                    "message": str(exc),
+                },
+            )
+
+    async def _add_project(self, data: dict[str, Any]) -> None:
+        chat_id = data["chat_id"]
+        try:
+            project = projects.add_project(data["path"], self._project_roots, self._laptop_name)
+            await self._emit(
+                None,
+                {
+                    "type": "project_result",
+                    "chat_id": chat_id,
+                    "action": "add",
+                    "ok": True,
+                    **project,
+                },
+            )
+        except projects.ProjectError as exc:
+            await self._emit(
+                None,
+                {
+                    "type": "project_result",
+                    "chat_id": chat_id,
+                    "action": "add",
+                    "ok": False,
+                    "message": str(exc),
+                },
+            )
 
     async def _pump(self, session_id: str, session: ClaudeSession) -> None:
         async for message in session:

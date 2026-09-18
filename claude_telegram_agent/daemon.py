@@ -91,7 +91,7 @@ async def run(config: dict[str, Any]) -> None:
         except (websockets.exceptions.ConnectionClosed, OSError) as exc:
             print(f"failed to send event ({data.get('type')}): {exc!r}")
 
-    manager = SessionManager(project_roots, emit)
+    manager = SessionManager(project_roots, emit, laptop_name=socket.gethostname())
     attempt = 0
     try:
         while True:

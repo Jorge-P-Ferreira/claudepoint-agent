@@ -399,3 +399,145 @@ async def test_shutdown_disconnects_every_live_session_and_clears_the_dict() -> 
     assert live1.disconnected is True
     assert live2.disconnected is True
     assert manager.sessions == {}
+
+
+# ---- create_project / add_project (Phase 6) — laptop-scoped, no session_id --------
+
+
+async def _emitting_manager(laptop_name: str = "jorge-xps"):
+    emitted: list[tuple[str | None, dict]] = []
+
+    async def _capture(session_id, data):
+        emitted.append((session_id, data))
+
+    manager = session_manager.SessionManager(
+        project_roots=["/root"], emit=_capture, laptop_name=laptop_name
+    )
+    return manager, emitted
+
+
+async def test_dispatch_create_project_emits_ok_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    from claude_telegram_agent import projects
+
+    manager, emitted = await _emitting_manager()
+    def _fake_create(name, git_init, roots):
+        return {"project_id": "p1", "path": "/root/widget", "name": "widget"}
+
+    monkeypatch.setattr(projects, "create_project", _fake_create)
+
+    await manager.dispatch(
+        {
+            "session_id": None,
+            "data": {"type": "create_project", "chat_id": 42, "name": "widget", "git_init": True},
+        }
+    )
+
+    assert emitted == [
+        (
+            None,
+            {
+                "type": "project_result",
+                "chat_id": 42,
+                "action": "create",
+                "ok": True,
+                "project_id": "p1",
+                "path": "/root/widget",
+                "name": "widget",
+            },
+        )
+    ]
+
+
+async def test_dispatch_create_project_emits_failure_on_project_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_telegram_agent import projects
+
+    manager, emitted = await _emitting_manager()
+
+    def _raise(name, git_init, roots):
+        raise projects.ProjectError("'widget' already exists on this laptop.")
+
+    monkeypatch.setattr(projects, "create_project", _raise)
+
+    await manager.dispatch(
+        {"session_id": None, "data": {"type": "create_project", "chat_id": 42, "name": "widget"}}
+    )
+
+    assert emitted == [
+        (
+            None,
+            {
+                "type": "project_result",
+                "chat_id": 42,
+                "action": "create",
+                "ok": False,
+                "message": "'widget' already exists on this laptop.",
+            },
+        )
+    ]
+
+
+async def test_dispatch_add_project_passes_laptop_name_and_emits_ok_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_telegram_agent import projects
+
+    manager, emitted = await _emitting_manager(laptop_name="jorge-xps")
+    calls: list[tuple[str, list[str], str]] = []
+
+    def _fake_add(path, roots, laptop_name):
+        calls.append((path, roots, laptop_name))
+        return {"project_id": "p2", "path": path, "name": "legacy-app"}
+
+    monkeypatch.setattr(projects, "add_project", _fake_add)
+
+    await manager.dispatch(
+        {"session_id": None, "data": {"type": "add_project", "chat_id": 7, "path": "/x/legacy-app"}}
+    )
+
+    assert calls == [("/x/legacy-app", ["/root"], "jorge-xps")]
+    assert emitted == [
+        (
+            None,
+            {
+                "type": "project_result",
+                "chat_id": 7,
+                "action": "add",
+                "ok": True,
+                "project_id": "p2",
+                "path": "/x/legacy-app",
+                "name": "legacy-app",
+            },
+        )
+    ]
+
+
+async def test_dispatch_add_project_emits_failure_on_project_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_telegram_agent import projects
+
+    manager, emitted = await _emitting_manager()
+
+    def _raise(path, roots, laptop_name):
+        raise projects.ProjectError("That path isn't under an allowed root on jorge-xps.")
+
+    monkeypatch.setattr(projects, "add_project", _raise)
+
+    await manager.dispatch(
+        {"session_id": None, "data": {"type": "add_project", "chat_id": 7, "path": "/etc"}}
+    )
+
+    assert emitted == [
+        (
+            None,
+            {
+                "type": "project_result",
+                "chat_id": 7,
+                "action": "add",
+                "ok": False,
+                "message": "That path isn't under an allowed root on jorge-xps.",
+            },
+        )
+    ]
