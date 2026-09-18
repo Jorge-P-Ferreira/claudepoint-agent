@@ -12,12 +12,14 @@ from claude_telegram_agent import events, permissions, session_manager
 
 
 class _FakeClaudeSession:
-    def __init__(self) -> None:
+    def __init__(self, messages: list[Any] | None = None) -> None:
         self.connect_calls: list[dict[str, Any]] = []
         self.can_use_tool_calls: list[Any] = []
         self.disconnected = False
         self.modes_set: list[str] = []
         self.interrupted = False
+        self.query_calls: list[str] = []
+        self._messages = messages or []
 
     async def connect(
         self,
@@ -39,12 +41,15 @@ class _FakeClaudeSession:
     async def interrupt(self) -> None:
         self.interrupted = True
 
-    def __aiter__(self):
-        async def _empty():
-            return
-            yield  # pragma: no cover - never reached, makes this an async generator
+    async def query(self, text: str) -> None:
+        self.query_calls.append(text)
 
-        return _empty()
+    def __aiter__(self):
+        async def _gen():
+            for message in self._messages:
+                yield message
+
+        return _gen()
 
 
 async def _emit(_session_id, _data) -> None:
@@ -234,6 +239,8 @@ async def test_end_session_disconnects_resets_and_drops_the_session(
     manager.sessions["sess1"] = live  # type: ignore[assignment]
     reset_calls: list[str] = []
     monkeypatch.setattr(events, "reset", lambda sid: reset_calls.append(sid))
+    forgotten: list[str] = []
+    monkeypatch.setattr(permissions, "forget_session", lambda sid: forgotten.append(sid))
     emitted: list[tuple[str | None, dict]] = []
 
     async def _capture(session_id, data):
@@ -246,6 +253,7 @@ async def test_end_session_disconnects_resets_and_drops_the_session(
     assert live.disconnected is True
     assert "sess1" not in manager.sessions
     assert reset_calls == ["sess1"]
+    assert forgotten == ["sess1"]  # "always allow" policy for this session is dropped too
     assert emitted == [("sess1", {"type": "session_status", "status": "ended"})]
 
 
@@ -541,3 +549,172 @@ async def test_dispatch_add_project_emits_failure_on_project_error(
             },
         )
     ]
+
+
+# ---- prompt queuing / cancel preemption (Phase 7) ----------------------------------
+
+
+async def test_prompt_queries_immediately_when_not_busy() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+
+    await manager.dispatch({"session_id": "sess1", "data": {"type": "prompt", "text": "hi"}})
+
+    assert live.query_calls == ["hi"]
+    assert manager._busy["sess1"] is True
+
+
+async def test_second_prompt_while_busy_is_appended_not_sent() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    manager._busy["sess1"] = True  # simulate a turn already running
+
+    await manager.dispatch(
+        {"session_id": "sess1", "data": {"type": "prompt", "text": "first queued"}}
+    )
+    await manager.dispatch(
+        {"session_id": "sess1", "data": {"type": "prompt", "text": "second queued"}}
+    )
+
+    assert live.query_calls == []  # neither reached the SDK yet
+    assert manager._queued_prompt["sess1"] == "first queued\n\nsecond queued"
+
+
+async def test_turn_end_drains_the_queued_prompt() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    manager._busy["sess1"] = True
+    manager._queued_prompt["sess1"] = "queued while busy"
+
+    await manager._on_turn_end("sess1", live)  # type: ignore[arg-type]
+
+    assert live.query_calls == ["queued while busy"]
+    assert manager._busy["sess1"] is True  # re-marked busy for the newly-sent turn
+    assert "sess1" not in manager._queued_prompt
+
+
+async def test_turn_end_with_nothing_queued_just_clears_busy() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    manager._busy["sess1"] = True
+
+    await manager._on_turn_end("sess1", live)  # type: ignore[arg-type]
+
+    assert live.query_calls == []
+    assert manager._busy["sess1"] is False
+
+
+async def test_turn_end_does_not_send_a_stale_queued_prompt_after_reconnect() -> None:
+    """If the session_id's slot was replaced (e.g. a decision-answer reconnect) while
+    the old turn was still finishing, a prompt queued against the *old* ClaudeSession
+    must not be sent to whatever now occupies that slot."""
+    manager = _manager()
+    old = _FakeClaudeSession()
+    new = _FakeClaudeSession()
+    manager.sessions["sess1"] = old  # type: ignore[assignment]
+    manager._busy["sess1"] = True
+    manager._queued_prompt["sess1"] = "queued against the old session"
+
+    manager.sessions["sess1"] = new  # type: ignore[assignment]  # simulate the reconnect
+
+    await manager._on_turn_end("sess1", old)  # type: ignore[arg-type]
+
+    assert old.query_calls == []
+    assert new.query_calls == []
+
+
+async def test_pump_drains_the_queue_on_a_real_result_message() -> None:
+    """End-to-end through `_pump` itself, not just `_on_turn_end` directly — proves the
+    `ResultMessage` isinstance check in `_pump` actually wires up to it."""
+    from claude_agent_sdk import ResultMessage
+
+    manager = _manager()
+    result = ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="claude-abc",
+        usage={},
+        result="done",
+    )
+    live = _FakeClaudeSession(messages=[result])
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    manager._busy["sess1"] = True
+    manager._queued_prompt["sess1"] = "queued while first turn ran"
+
+    await manager._pump("sess1", live)  # type: ignore[arg-type]
+
+    assert live.query_calls == ["queued while first turn ran"]
+
+
+async def test_cancel_drops_a_queued_prompt_without_ever_sending_it() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    manager._queued_prompt["sess1"] = "never sent"
+
+    await manager.dispatch({"session_id": "sess1", "data": {"type": "cancel"}})
+
+    assert live.interrupted is True
+    assert "sess1" not in manager._queued_prompt
+    assert live.query_calls == []
+
+
+async def test_end_session_clears_busy_and_queued_state() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    manager._busy["sess1"] = True
+    manager._queued_prompt["sess1"] = "orphaned"
+
+    await manager.dispatch({"session_id": "sess1", "data": {"type": "end_session"}})
+
+    assert "sess1" not in manager._busy
+    assert "sess1" not in manager._queued_prompt
+
+
+async def test_clear_session_clears_busy_and_queued_state() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    manager._busy["sess1"] = True
+    manager._queued_prompt["sess1"] = "orphaned"
+
+    await manager.dispatch(
+        {
+            "session_id": "sess1",
+            "data": {"type": "clear_session", "cwd": "/proj", "permission_mode": "default"},
+        }
+    )
+    await asyncio.sleep(0)
+
+    assert "sess1" not in manager._busy
+    assert "sess1" not in manager._queued_prompt
+
+
+async def test_decision_answer_clears_busy_and_queued_state() -> None:
+    manager = _manager()
+    live = _FakeClaudeSession()
+    manager.sessions["sess1"] = live  # type: ignore[assignment]
+    manager._busy["sess1"] = True
+    manager._queued_prompt["sess1"] = "orphaned"
+
+    await manager._decision_answer(
+        "sess1",
+        {
+            "defer_token": "tu1",
+            "cwd": "/proj",
+            "claude_session_id": "claude-abc",
+            "answer": {"kind": "permission", "choice": "allow"},
+        },
+    )
+    await asyncio.sleep(0)
+
+    assert "sess1" not in manager._busy
+    assert "sess1" not in manager._queued_prompt

@@ -18,6 +18,16 @@ curve (1->2->5->15->30s + jitter, `_backoff_delay`) and adds resume-from-restart
   can tell "still running, nothing to do" from "gone, please resume" per session and
   push a `new_session` cmd (with a `claude_session_id` to resume) only for the latter
   — see `docs/session-model.md` § Resume.
+
+Phase 7 (this file, now) closes the one-directional gap in at-least-once delivery: the
+broker's own `_unacked`/`_flush_unacked` already retried `cmd` frames sent while briefly
+disconnected, but an `event` frame `emit()` couldn't send just got dropped with a
+`print`. `_Connection.unacked` mirrors the broker's structure on this side — `emit`
+buffers every frame before attempting to send it, `_run_once`'s frame loop clears an
+entry on the matching broker->agent `ack` (new: the broker now acks inbound `event`
+frames too, see `ws_hub.py::_ack_event`), and anything still unacked is resent right
+after the next `hello`, reusing the same frame `id`s (safe under the broker's own
+`_seen_ids` dedupe).
 """
 
 from __future__ import annotations
@@ -71,10 +81,12 @@ def _envelope(kind: str, session_id: str | None, data: dict[str, Any]) -> dict[s
 class _Connection:
     """Holds the currently-live websocket, if any. `emit` closes over this (not a
     specific `ws` object) so it keeps working correctly across reconnects — `_run_once`
-    updates `.ws` on connect and clears it in its `finally`."""
+    updates `.ws` on connect and clears it in its `finally`. `unacked` (Phase 7) is the
+    outbound-`event` counterpart to the broker's own `_unacked` — see module docstring."""
 
     def __init__(self) -> None:
         self.ws: ClientConnection | None = None
+        self.unacked: dict[str, dict[str, Any]] = {}
 
 
 async def run(config: dict[str, Any]) -> None:
@@ -82,14 +94,19 @@ async def run(config: dict[str, Any]) -> None:
     conn = _Connection()
 
     async def emit(session_id: str | None, data: dict[str, Any]) -> None:
+        frame = _envelope("event", session_id, data)
+        # Buffered before the send attempt, not after — the buffer *is* the retry
+        # mechanism now, so a failed/impossible send just leaves it there for the next
+        # connection's post-`hello` flush rather than needing a separate drop-and-log
+        # path.
+        conn.unacked[frame["id"]] = frame
         ws = conn.ws
         if ws is None:
-            print(f"dropping event (disconnected): {data.get('type')}")
             return
         try:
-            await ws.send(json.dumps(_envelope("event", session_id, data)))
+            await ws.send(json.dumps(frame))
         except (websockets.exceptions.ConnectionClosed, OSError) as exc:
-            print(f"failed to send event ({data.get('type')}): {exc!r}")
+            print(f"failed to send event ({data.get('type')}): {exc!r} — buffered for retry")
 
     manager = SessionManager(project_roots, emit, laptop_name=socket.gethostname())
     attempt = 0
@@ -143,6 +160,11 @@ async def _run_once(config: dict[str, Any], manager: SessionManager, conn: _Conn
             )
         )
 
+        # Anything still unacked from a previous, briefly-broken connection — resend
+        # now, same frame `id`s, mirroring the broker's own post-hello `_flush_unacked`.
+        for frame in list(conn.unacked.values()):
+            await ws.send(json.dumps(frame))
+
         heartbeat_task = asyncio.create_task(_heartbeat_loop(ws))
         try:
             async for raw in ws:
@@ -157,6 +179,8 @@ async def _run_once(config: dict[str, Any], manager: SessionManager, conn: _Conn
                     await _dispatch_cmd(manager, frame, ws)
                 elif kind == "ping":
                     await ws.send(json.dumps(_envelope("heartbeat", None, {})))
+                elif kind == "ack":
+                    conn.unacked.pop(frame.get("data", {}).get("ref"), None)
         finally:
             heartbeat_task.cancel()
             conn.ws = None

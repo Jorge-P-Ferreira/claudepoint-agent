@@ -27,6 +27,15 @@ pinned down by static reading of `claude_agent_sdk` 0.2.152 alone (no dedicated
 "answer this deferred tool" API surfaced there) — confirm against a real `claude`
 session (the Phase 2 integration test's `ls` case, then a kill-and-restart variant)
 before relying on it in production.
+
+`_session_always_allowed` (this file, now): "Always allow <Tool>" previously resolved
+only the one call it was tapped on — indistinguishable from a one-time "Allow," despite
+its own label — since nothing recorded the choice anywhere. Confirmed live: every
+repeat call to the same tool kept prompting again. Now the choice is remembered per
+`(session_id, tool_name)` for as long as that session exists (cleared on
+`end_session`, but *not* on `clear_session`/a decision-answer reconnect — it's a
+phone-side policy about what this session slot is allowed to do, independent of
+whatever Claude-side conversation history `/clear` wipes).
 """
 
 from __future__ import annotations
@@ -50,9 +59,19 @@ _ALWAYS_GATED_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 # recorded by session_manager right before it reconnects to resume a deferred call.
 _pending_answers: dict[str, dict[str, Any]] = {}
 
+# session_id -> tool names the user has tapped "Always allow <Tool>" for. Checked
+# before ever emitting a new decision_request for that tool again.
+_session_always_allowed: dict[str, set[str]] = {}
+
 
 def register_answer(tool_use_id: str, answer: dict[str, Any]) -> None:
     _pending_answers[tool_use_id] = answer
+
+
+def forget_session(session_id: str) -> None:
+    """Called from `session_manager.py::_end_session` — a session that's gone has no
+    more "always allow" policy to remember."""
+    _session_always_allowed.pop(session_id, None)
 
 
 async def can_use_tool(
@@ -80,12 +99,17 @@ def make_pre_tool_use_hook(emit: EmitFn, session_id: str) -> HookMatcher:
         mode = input_data.get("permission_mode")
 
         if tool_name not in _ALWAYS_GATED_TOOLS and (
-            tool_name in _AUTO_ALLOW_TOOLS or mode in _AUTO_ALLOW_MODES
+            tool_name in _AUTO_ALLOW_TOOLS
+            or mode in _AUTO_ALLOW_MODES
+            or tool_name in _session_always_allowed.get(session_id, ())
         ):
             return _allow()
 
         if tool_use_id and tool_use_id in _pending_answers:
-            return _answer_to_hook_output(tool_input, _pending_answers.pop(tool_use_id))
+            answer = _pending_answers.pop(tool_use_id)
+            if answer.get("kind") == "permission" and answer.get("choice") == "always":
+                _session_always_allowed.setdefault(session_id, set()).add(tool_name)
+            return _answer_to_hook_output(tool_input, answer)
 
         decision_kind, payload, options = _classify(tool_name, tool_input)
         await emit(

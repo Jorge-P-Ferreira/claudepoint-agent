@@ -20,6 +20,21 @@ than a return value, since the broker's dispatching HTTP route returns immediate
 (`shared/data-model.md`'s "agent-side check happens before the broker ever writes the
 doc" rule). `remove_project` never reaches here: the broker deregisters
 `projects/{id}` directly since it never touches the laptop filesystem.
+
+Phase 7 (this file, now) implements the turn-queueing `claude_session.py`'s own module
+docstring has always named as this class's job: `_prompt` no longer calls
+`session.query()` unconditionally — a session already mid-turn (`self._busy`) has the
+new text appended to whatever's already queued (`self._queued_prompt`, blank-line
+separated — a second prompt sent before the first even started doesn't replace or get
+rejected, it joins on) rather than being written onto the SDK's already-open stdin
+stream with no coordination, which was untested, undefined-interleaving behavior
+before this. `_pump` watches for `ResultMessage` (turn end) to flip `_busy` back off
+and drain any queued text. `_cancel` pops `_queued_prompt` *before* interrupting the
+live turn — per `shared/commands.md`'s contract ("`cancel` preceding a queued prompt
+drops it rather than sending it after"), this is the entire "cancel preempts the
+queue" mechanism. Both dicts are cleared alongside `self.sessions[...]` at every point
+a session's `ClaudeSession` gets replaced or torn down, so stale busy/queue state can
+never leak across a reconnect.
 """
 
 from __future__ import annotations
@@ -27,6 +42,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+from claude_agent_sdk import ResultMessage
 
 from . import events, permissions, projects
 from .claude_session import ClaudeSession
@@ -37,6 +54,8 @@ EmitFn = Callable[[str | None, dict[str, Any]], Awaitable[None]]
 class SessionManager:
     def __init__(self, project_roots: list[str], emit: EmitFn, laptop_name: str = "") -> None:
         self.sessions: dict[str, ClaudeSession] = {}
+        self._busy: dict[str, bool] = {}
+        self._queued_prompt: dict[str, str | None] = {}
         self._project_roots = project_roots
         self._emit = emit
         self.emit = emit  # public alias — daemon.py's dispatch-failure handling uses this
@@ -114,7 +133,34 @@ class SessionManager:
                 },
             )
             return
+
+        if self._busy.get(session_id):
+            # A turn is already running — append rather than write a second `query()`
+            # onto the same open stdin stream (undefined interleaving) or drop/reject
+            # the new text. `_on_turn_end` sends this once the current turn's
+            # `ResultMessage` arrives.
+            existing = self._queued_prompt.get(session_id)
+            self._queued_prompt[session_id] = (
+                f"{existing}\n\n{data['text']}" if existing else data["text"]
+            )
+            return
+
+        self._busy[session_id] = True
         await session.query(data["text"])
+
+    async def _on_turn_end(self, session_id: str, session: ClaudeSession) -> None:
+        self._busy[session_id] = False
+        queued = self._queued_prompt.pop(session_id, None)
+        if queued is None:
+            return
+        # Identity check: guards against a reconnect (decision answer, clear, end)
+        # having replaced or removed this session_id's entry while the turn that just
+        # ended was still running — a queued prompt for the *old* ClaudeSession must
+        # not be sent to whatever now occupies its slot.
+        if self.sessions.get(session_id) is not session:
+            return
+        self._busy[session_id] = True
+        await session.query(queued)
 
     async def _decision_answer(self, session_id: str, data: dict[str, Any]) -> None:
         """Resolve a parked `PreToolUse` defer. `permissions.register_answer` makes the
@@ -125,6 +171,10 @@ class SessionManager:
         answer = data.get("answer", {})
         defer_token = data.get("defer_token", "")
         permissions.register_answer(defer_token, answer)
+        # Whatever turn/queue state this session_id had belonged to the connection
+        # being replaced below — never carry it into the reconnected one.
+        self._busy.pop(session_id, None)
+        self._queued_prompt.pop(session_id, None)
 
         session = self.sessions.get(session_id)
         if session is not None:
@@ -182,10 +232,17 @@ class SessionManager:
                 },
             )
             return
+        # Drop any not-yet-sent queued prompt *before* interrupting the live turn —
+        # this is the entire "cancel preempts the queue" mechanism
+        # (`shared/commands.md`'s `prompt`/`cancel` contract).
+        self._queued_prompt.pop(session_id, None)
         await session.interrupt()
 
     async def _end_session(self, session_id: str) -> None:
         session = self.sessions.pop(session_id, None)
+        self._busy.pop(session_id, None)
+        self._queued_prompt.pop(session_id, None)
+        permissions.forget_session(session_id)
         if session is not None:
             await session.disconnect()
         events.reset(session_id)
@@ -196,6 +253,8 @@ class SessionManager:
         `session_id` — same chat binding, blank history (`shared/commands.md`'s
         `clear_session` row). Mirrors `_decision_answer`'s "still live vs. dead"
         reconnect split."""
+        self._busy.pop(session_id, None)
+        self._queued_prompt.pop(session_id, None)
         session = self.sessions.get(session_id)
         if session is not None:
             await session.disconnect()
@@ -271,6 +330,8 @@ class SessionManager:
         async for message in session:
             for event_data in events.to_frames(message, session_id):
                 await self._emit(session_id, event_data)
+            if isinstance(message, ResultMessage):
+                await self._on_turn_end(session_id, session)
 
     async def shutdown(self) -> None:
         """Disconnect every live session's `ClaudeSDKClient` — `daemon.py::run` calls

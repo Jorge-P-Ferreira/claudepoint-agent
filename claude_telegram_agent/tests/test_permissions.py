@@ -187,3 +187,71 @@ async def test_permissive_modes_still_gate_ask_user_question(mode: str) -> None:
     )
     assert result["hookSpecificOutput"]["permissionDecision"] == "defer"
     assert len(emit.calls) == 1
+
+
+# ---- "Always allow <Tool>" persistence (bug fix — confirmed live, 2026-09-18: it
+# previously behaved exactly like a one-time "Allow," nothing remembered the choice) --
+
+
+async def test_always_allow_is_remembered_for_later_calls_in_the_same_session() -> None:
+    emit = _Emitted()
+    hook = _hook(emit, "sess-always-1")
+    permissions.register_answer("tu-a1", {"kind": "permission", "choice": "always"})
+
+    first = await hook({"tool_name": "Bash", "tool_input": {"command": "ls"}}, "tu-a1", None)
+    assert first["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    # A brand-new tool_use_id, same tool, same session, no registered answer this
+    # time — must still auto-allow, no second decision_request.
+    second = await hook({"tool_name": "Bash", "tool_input": {"command": "pwd"}}, "tu-a2", None)
+    assert second["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert emit.calls == []
+
+
+async def test_always_allow_is_scoped_to_the_tool_name() -> None:
+    emit = _Emitted()
+    hook = _hook(emit, "sess-always-2")
+    permissions.register_answer("tu-b1", {"kind": "permission", "choice": "always"})
+    await hook({"tool_name": "Bash", "tool_input": {}}, "tu-b1", None)
+
+    result = await hook({"tool_name": "Write", "tool_input": {"path": "x"}}, "tu-b2", None)
+
+    assert result["hookSpecificOutput"]["permissionDecision"] == "defer"
+    assert len(emit.calls) == 1
+
+
+async def test_always_allow_is_scoped_to_the_session() -> None:
+    emit = _Emitted()
+    permissions.register_answer("tu-c1", {"kind": "permission", "choice": "always"})
+    await _hook(emit, "sess-always-3")({"tool_name": "Bash", "tool_input": {}}, "tu-c1", None)
+
+    result = await _hook(emit, "sess-always-4")(
+        {"tool_name": "Bash", "tool_input": {}}, "tu-c2", None
+    )
+
+    assert result["hookSpecificOutput"]["permissionDecision"] == "defer"
+
+
+async def test_a_plain_allow_does_not_get_remembered() -> None:
+    """Only "always" persists — a one-time "allow" (or "deny") must keep prompting on
+    the next call, same as before this fix."""
+    emit = _Emitted()
+    hook = _hook(emit, "sess-always-5")
+    permissions.register_answer("tu-d1", {"kind": "permission", "choice": "allow"})
+    await hook({"tool_name": "Bash", "tool_input": {}}, "tu-d1", None)
+
+    result = await hook({"tool_name": "Bash", "tool_input": {}}, "tu-d2", None)
+
+    assert result["hookSpecificOutput"]["permissionDecision"] == "defer"
+
+
+async def test_forget_session_clears_the_always_allow_set() -> None:
+    emit = _Emitted()
+    hook = _hook(emit, "sess-always-6")
+    permissions.register_answer("tu-e1", {"kind": "permission", "choice": "always"})
+    await hook({"tool_name": "Bash", "tool_input": {}}, "tu-e1", None)
+
+    permissions.forget_session("sess-always-6")
+
+    result = await hook({"tool_name": "Bash", "tool_input": {}}, "tu-e2", None)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "defer"

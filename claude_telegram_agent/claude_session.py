@@ -1,9 +1,10 @@
 """ClaudeSDKClient wrapper — one per session. Mapping: ../../docs/claude-driver.md.
 
 Stays a thin wrapper around the SDK client; `session_manager.SessionManager` owns
-turn-queueing (`enqueue_prompt`, Phase 3), decision-answer routing
-(`permissions.register_answer` + reconnecting to resume, Phase 2), and slot lifecycle
-(`close(keep_slot=...)`) on top of this.
+turn-queueing (`_busy`/`_queued_prompt`/`_on_turn_end`, Phase 7 — a prompt sent while
+this session's turn is still running is held and sent once it ends, per
+`shared/commands.md`) and decision-answer routing (`permissions.register_answer` +
+reconnecting to resume, Phase 2) on top of this.
 
 Phase 2: `connect()` takes a `PreToolUse` hook (built by `permissions.py`, which owns
 all decision classification/resume logic) instead of Phase 1's plain `can_use_tool`.

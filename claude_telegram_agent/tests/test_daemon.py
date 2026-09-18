@@ -90,10 +90,12 @@ async def test_run_passes_the_same_manager_across_reconnects(
     assert seen_managers[0] is seen_managers[1]
 
 
-async def test_emit_drops_events_while_disconnected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`conn.ws is None` (no live socket right now) must not raise — the event is
-    just dropped, matching this module's best-effort philosophy elsewhere."""
+async def test_emit_buffers_events_while_disconnected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`conn.ws is None` (no live socket right now) must not raise — and, since Phase 7,
+    the event isn't just dropped either: it's buffered in `conn.unacked` for the next
+    connection's post-`hello` flush (this module's docstring)."""
     captured_emit = {}
+    captured_conn = {}
 
     class _FakeManager:
         sessions: dict = {}
@@ -108,6 +110,7 @@ async def test_emit_drops_events_while_disconnected(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(daemon, "SessionManager", fake_session_manager)
 
     async def fake_run_once(config, manager, conn) -> None:
+        captured_conn["conn"] = conn
         raise SystemExit
 
     monkeypatch.setattr(daemon, "_run_once", fake_run_once)
@@ -116,8 +119,155 @@ async def test_emit_drops_events_while_disconnected(monkeypatch: pytest.MonkeyPa
         await daemon.run({"broker_url": "ws://localhost", "laptop_token": "t"})
 
     # conn.ws was never set (no successful connect in this fake run) — emit must be a
-    # silent no-op, not an exception.
+    # silent no-op, not an exception, and the event must land in unacked rather than
+    # vanish.
     await captured_emit["emit"]("sess1", {"type": "assistant_text", "text": "hi"})
+
+    buffered = list(captured_conn["conn"].unacked.values())
+    assert len(buffered) == 1
+    assert buffered[0]["data"] == {"type": "assistant_text", "text": "hi"}
+
+
+class _FakeWebSocket:
+    """Duck-typed stand-in for `websockets.asyncio.client.ClientConnection`, just
+    enough of it for `_run_once`: an initial `welcome` on `.recv()`, then whatever
+    frames `incoming` holds via async iteration, recording everything sent."""
+
+    def __init__(self, incoming: list[dict] | None = None) -> None:
+        self.sent: list[str] = []
+        self._incoming = incoming or []
+
+    async def recv(self) -> str:
+        return json.dumps({"kind": "welcome"})
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(raw)
+
+    def __aiter__(self):
+        async def _gen():
+            for frame in self._incoming:
+                yield json.dumps(frame)
+
+        return _gen()
+
+
+class _FakeConnectCtx:
+    def __init__(self, ws: _FakeWebSocket) -> None:
+        self._ws = ws
+
+    async def __aenter__(self) -> _FakeWebSocket:
+        return self._ws
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+def _patch_connect(monkeypatch: pytest.MonkeyPatch, ws: _FakeWebSocket) -> None:
+    monkeypatch.setattr(daemon.websockets, "connect", lambda *a, **k: _FakeConnectCtx(ws))
+    monkeypatch.setattr(daemon.projects, "discover", lambda roots: [])
+
+
+class _FakeManagerNoOp:
+    sessions: dict = {}
+
+    async def dispatch(self, frame: dict) -> None:
+        pass
+
+    async def emit(self, session_id: str | None, data: dict) -> None:
+        pass
+
+
+async def test_run_once_flushes_unacked_events_after_hello(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frame buffered while briefly disconnected (`conn.unacked`) must be resent
+    right after the next connection's `hello`, mirroring the broker's own post-hello
+    `_flush_unacked` — same frame id, safe under the broker's `_seen_ids` dedupe."""
+    conn = daemon._Connection()
+    stale_frame = {
+        "v": 1,
+        "id": "stale-1",
+        "ts": 0,
+        "session_id": "sess1",
+        "kind": "event",
+        "data": {"type": "assistant_text", "text": "missed"},
+    }
+    conn.unacked["stale-1"] = stale_frame
+
+    fake_ws = _FakeWebSocket(incoming=[])
+    _patch_connect(monkeypatch, fake_ws)
+
+    await daemon._run_once(
+        {"broker_url": "ws://x", "laptop_token": "t"}, _FakeManagerNoOp(), conn  # type: ignore[arg-type]
+    )
+
+    sent_frames = [json.loads(s) for s in fake_ws.sent]
+    assert any(f.get("id") == "stale-1" for f in sent_frames)
+
+
+async def test_ack_frame_clears_the_matching_unacked_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = daemon._Connection()
+    conn.unacked["stale-1"] = {
+        "v": 1,
+        "id": "stale-1",
+        "ts": 0,
+        "session_id": "s1",
+        "kind": "event",
+        "data": {},
+    }
+    ack_frame = {
+        "v": 1,
+        "id": "ack-1",
+        "ts": 0,
+        "session_id": "s1",
+        "kind": "ack",
+        "data": {"ref": "stale-1"},
+    }
+    fake_ws = _FakeWebSocket(incoming=[ack_frame])
+    _patch_connect(monkeypatch, fake_ws)
+
+    await daemon._run_once(
+        {"broker_url": "ws://x", "laptop_token": "t"}, _FakeManagerNoOp(), conn  # type: ignore[arg-type]
+    )
+
+    assert "stale-1" not in conn.unacked
+
+
+async def test_duplicate_incoming_frame_id_is_processed_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatched: list[dict] = []
+
+    class _FakeManager:
+        sessions: dict = {}
+
+        async def dispatch(self, frame: dict) -> None:
+            dispatched.append(frame)
+
+        async def emit(self, session_id, data) -> None:
+            pass
+
+    cmd_frame = {
+        "v": 1,
+        "id": "dupe-1",
+        "ts": 0,
+        "session_id": "s1",
+        "kind": "cmd",
+        "data": {"type": "set_mode", "mode": "plan"},
+    }
+    # Identical frame id, twice — the second must be a no-op (dedup).
+    fake_ws = _FakeWebSocket(incoming=[cmd_frame, dict(cmd_frame)])
+    _patch_connect(monkeypatch, fake_ws)
+
+    await daemon._run_once(
+        {"broker_url": "ws://x", "laptop_token": "t"},
+        _FakeManager(),  # type: ignore[arg-type]
+        daemon._Connection(),
+    )
+
+    assert len(dispatched) == 1
 
 
 async def test_run_shuts_down_the_manager_on_exit(monkeypatch: pytest.MonkeyPatch) -> None:
