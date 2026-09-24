@@ -28,6 +28,15 @@ entry on the matching broker->agent `ack` (new: the broker now acks inbound `eve
 frames too, see `ws_hub.py::_ack_event`), and anything still unacked is resent right
 after the next `hello`, reusing the same frame `id`s (safe under the broker's own
 `_seen_ids` dedupe).
+
+Post-Phase-7 hardening (this file, now): `run()`'s reconnect loop no longer resets
+`attempt` to 0 just because `_run_once` returned without raising. The `websockets`
+client's `async for raw in ws:` loop exits that way on *any* normal server-side close,
+not only a genuinely healthy long-lived connection — so a proxy or idle-timeout
+repeatedly closing the socket "cleanly" was reconnecting instantly with zero backoff
+every time, hammering the broker and re-triggering its offline/online notification on
+every cycle. The reset now depends on `_STABLE_CONNECTION_SECONDS` of actual uptime,
+judged the same way whether `_run_once` raised or returned cleanly.
 """
 
 from __future__ import annotations
@@ -53,6 +62,14 @@ HEARTBEAT_INTERVAL_SECONDS = 20
 # quickly enough to feel responsive on a short blip without hammering the broker
 # during a long one.
 _BACKOFF_SCHEDULE = (1.0, 2.0, 5.0, 15.0, 30.0)
+
+# A connection alive at least this long counts as a genuine, working reconnect — not
+# a flap — and resets the backoff schedule back to the top. Judged by wall-clock time
+# connected, not by whether `_run_once` happened to raise: the `websockets` client's
+# `async for raw in ws:` loop exits *without raising* on a normal server-side close
+# (not just an abnormal drop), so a "clean" exit isn't on its own evidence the
+# connection was healthy — see `run`'s loop below.
+_STABLE_CONNECTION_SECONDS = 30.0
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -112,14 +129,28 @@ async def run(config: dict[str, Any]) -> None:
     attempt = 0
     try:
         while True:
+            connected_at = time.monotonic()
+            exc: Exception | None = None
             try:
                 await _run_once(config, manager, conn)
-                attempt = 0  # a clean exit (shouldn't normally happen) resets the backoff
-            except (websockets.exceptions.ConnectionClosed, OSError) as exc:
-                delay = _backoff_delay(attempt)
-                print(f"connection lost ({exc!r}) — retrying in {delay:.1f}s")
-                attempt += 1
-                await asyncio.sleep(delay)
+            except (websockets.exceptions.ConnectionClosed, OSError) as caught:
+                exc = caught
+
+            # Judge by how long the connection actually stayed up, not by whether
+            # `_run_once` raised — a server-side "clean" close (e.g. an idle-timeout
+            # proxy) exits the receive loop without an exception just as readily as a
+            # real abnormal drop, and both deserve backoff if they keep happening
+            # fast. Only a connection that was genuinely stable resets the schedule
+            # and reconnects immediately.
+            if time.monotonic() - connected_at >= _STABLE_CONNECTION_SECONDS:
+                attempt = 0
+                continue
+
+            delay = _backoff_delay(attempt)
+            reason = f"connection lost ({exc!r})" if exc is not None else "connection closed"
+            print(f"{reason} — retrying in {delay:.1f}s")
+            attempt += 1
+            await asyncio.sleep(delay)
     finally:
         # Ctrl+C, a real process shutdown, or a test simulating one (cancelling this
         # task) — either way, don't leave any `claude` subprocess resident. See

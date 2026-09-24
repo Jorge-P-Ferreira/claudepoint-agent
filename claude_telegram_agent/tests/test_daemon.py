@@ -3,6 +3,7 @@ across reconnects, and dispatch-failure isolation."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -65,6 +66,73 @@ async def test_run_reconnects_after_os_error(monkeypatch: pytest.MonkeyPatch) ->
         await daemon.run({"broker_url": "ws://localhost", "laptop_token": "t"})
 
     assert calls == 2
+
+
+async def test_run_backs_off_on_a_fast_clean_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A `_run_once` that returns *without raising* (the `websockets` client's receive
+    loop exits this way on a normal server-side close, e.g. an idle-timeout proxy —
+    not just on a real abnormal drop) must still back off if it keeps happening fast.
+    Previously a clean exit reset `attempt` to 0 and reconnected with zero delay,
+    turning a repeatedly-closing-cleanly connection into a tight reconnect loop."""
+    calls = 0
+    delays: list[int] = []
+
+    async def fake_run_once(config, manager, conn) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise SystemExit
+        return  # returns cleanly, near-instantly — no exception
+
+    def fake_backoff_delay(attempt: int) -> float:
+        delays.append(attempt)
+        return 0
+
+    monkeypatch.setattr(daemon, "_run_once", fake_run_once)
+    monkeypatch.setattr(daemon, "_backoff_delay", fake_backoff_delay)
+    # nothing in this test is ever "stable"
+    monkeypatch.setattr(daemon, "_STABLE_CONNECTION_SECONDS", 3600.0)
+
+    with pytest.raises(SystemExit):
+        await daemon.run({"broker_url": "ws://localhost", "laptop_token": "t"})
+
+    assert calls == 3
+    assert delays == [0, 1]  # attempt increments on each fast clean exit, never resets
+
+
+async def test_run_resets_backoff_after_a_stable_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection that stays up past `_STABLE_CONNECTION_SECONDS` resets the backoff
+    schedule — whether it then closes cleanly or drops via an exception — and
+    reconnects immediately, same as before this fix for a genuinely healthy
+    connection."""
+    calls = 0
+    delays: list[int] = []
+
+    async def fake_run_once(config, manager, conn) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise websockets.exceptions.ConnectionClosed(None, None)  # fails instantly
+        if calls == 2:
+            await asyncio.sleep(0.05)  # stays up past the (tiny) stability threshold
+            return
+        raise SystemExit
+
+    def fake_backoff_delay(attempt: int) -> float:
+        delays.append(attempt)
+        return 0
+
+    monkeypatch.setattr(daemon, "_run_once", fake_run_once)
+    monkeypatch.setattr(daemon, "_backoff_delay", fake_backoff_delay)
+    monkeypatch.setattr(daemon, "_STABLE_CONNECTION_SECONDS", 0.02)
+
+    with pytest.raises(SystemExit):
+        await daemon.run({"broker_url": "ws://localhost", "laptop_token": "t"})
+
+    assert calls == 3
+    assert delays == [0]  # only the first, near-instant failure backed off
 
 
 async def test_run_passes_the_same_manager_across_reconnects(
