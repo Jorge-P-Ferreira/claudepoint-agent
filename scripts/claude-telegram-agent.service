@@ -18,6 +18,4 @@
 # [Install]
 # WantedBy=default.target
 #
-# ── macOS equivalent ──────────────────────────────────────────────────────────
-# ~/Library/LaunchAgents/com.claudepoint.agent.plist with <key>KeepAlive</key><true/>
-# and ProgramArguments = [ claude-telegram-agent, run ]; load with `launchctl load`.
+# macOS: use install_launchd.sh instead.

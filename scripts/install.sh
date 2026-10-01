@@ -36,7 +36,8 @@ case "$(uname -s 2>/dev/null || echo unknown)" in
     ;;
   Darwin)
     echo
-    echo "Optional background service: wrap as a launchd agent (not yet templated here)."
+    echo "Optional background service (launchd: starts at login, restarts on crash):"
+    echo "  scripts/install_launchd.sh"
     ;;
   *)
     echo
