@@ -1,12 +1,13 @@
-"""CLI entrypoint: claude-telegram-agent {pair|run|status|unpair}."""
+"""CLI entrypoint: claude-telegram-agent {pair|run|status|unpair|service}."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import sys
+from pathlib import Path
 
-from . import config, daemon, pairing, projects
+from . import config, daemon, pairing, projects, service
 
 
 def _cmd_pair(args: argparse.Namespace) -> int:
@@ -15,7 +16,14 @@ def _cmd_pair(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_run(_args: argparse.Namespace) -> int:
+def _cmd_run(args: argparse.Namespace) -> int:
+    if args.log_file:
+        # The Windows scheduled task runs under pythonw.exe, where sys.stdout/stderr
+        # are None — every print() would fail without this.
+        log_file = Path(args.log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        stream = log_file.open("a", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stderr = stream
     cfg = config.load_config()
     asyncio.run(daemon.run(cfg))
     return 0
@@ -43,6 +51,11 @@ def _cmd_unpair(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_service(args: argparse.Namespace) -> int:
+    print(service.install() if args.action == "install" else service.uninstall())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="claude-telegram-agent")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -64,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pair.set_defaults(func=_cmd_pair)
 
     p_run = sub.add_parser("run", help="connect to the broker and serve sessions")
+    p_run.add_argument("--log-file", help="append output to this file instead of the console")
     p_run.set_defaults(func=_cmd_run)
 
     p_status = sub.add_parser("status", help="show local config and discovered projects")
@@ -71,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_unpair = sub.add_parser("unpair", help="remove local pairing config")
     p_unpair.set_defaults(func=_cmd_unpair)
+
+    p_service = sub.add_parser(
+        "service", help="run the agent in the background at login (launchd/systemd/schtasks)"
+    )
+    p_service.add_argument("action", choices=["install", "uninstall"])
+    p_service.set_defaults(func=_cmd_service)
 
     return parser
 

@@ -25,22 +25,6 @@ echo "  1. On the bot: /pair -> copy the code"
 echo "  2. claude-telegram-agent pair <code> --broker https://<broker-host>"
 echo "  3. claude-telegram-agent run   # foreground; see run_local.sh for local broker dev"
 
-case "$(uname -s 2>/dev/null || echo unknown)" in
-  Linux)
-    echo
-    echo "Optional background service (systemd user unit):"
-    echo "  mkdir -p ~/.config/systemd/user"
-    echo "  cp scripts/claude-telegram-agent.service ~/.config/systemd/user/"
-    echo "  systemctl --user enable --now claude-telegram-agent"
-    echo "  loginctl enable-linger \"\$USER\"   # keep it running after logout"
-    ;;
-  Darwin)
-    echo
-    echo "Optional background service (launchd: starts at login, restarts on crash):"
-    echo "  scripts/install_launchd.sh"
-    ;;
-  *)
-    echo
-    echo "No background-service wrapper for this OS yet — run 'claude-telegram-agent run' directly."
-    ;;
-esac
+echo
+echo "Optional background service (starts at login, restarts on crash):"
+echo "  claude-telegram-agent service install"

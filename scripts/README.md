@@ -1,12 +1,13 @@
 # agent/scripts/
 
-Helpers for installing and running the laptop daemon. `run_local.sh`/`install.sh` are
-Linux/macOS convenience wrappers; on Windows just run the installed console script
-directly (`claude-telegram-agent run`) — no wrapper needed.
-
 | File | Purpose |
 |---|---|
-| `install.sh` | `pipx install .` (or `uv tool install .`, or plain `pip install --user -e .`), prints next steps. No `ANTHROPIC_API_KEY` needed — the Agent SDK rides the local `claude` CLI's own login. |
+| `bootstrap.sh` | **One-paste install, macOS/Linux** — the line `/pair` prints. Installs the agent with uv from the public mirror, pairs it (`~/Projects` as the project root), then `claude-telegram-agent service install`. |
+| `bootstrap.ps1` | Same for **Windows** (PowerShell, `$env:CP_PAIR='<code> <broker>'; irm … \| iex`); registers a logon scheduled task. |
+| `install.sh` | Dev install from a checkout: `pipx install .` (or `uv tool install .`, or `pip install --user -e .`), prints next steps. |
 | `run_local.sh` | Foreground run against a local broker (pair first). |
-| `install_launchd.sh` | **macOS:** installs the agent as a launchd user agent — starts at login, restarts if it crashes, logs to `~/Library/Logs/claude-telegram-agent.log`. Pair first. `--uninstall` removes it. To keep it reachable with the lid closed, also run `sudo pmset -a disablesleep 1` (undo: `... 0`). |
-| `claude-telegram-agent.service` | Template unit. On Linux: a **systemd user service** (`~/.config/systemd/user/`, `loginctl enable-linger`). |
+| `install_launchd.sh` | **macOS**, from a checkout: thin wrapper over `claude-telegram-agent service install` that prefers this checkout's `.venv`. `--uninstall` removes it. |
+
+The background-service logic itself (launchd plist / systemd user unit / Task Scheduler
+XML) lives in `claude_telegram_agent/service.py`. No `ANTHROPIC_API_KEY` is needed
+anywhere — the Agent SDK rides the local `claude` CLI's own login.
