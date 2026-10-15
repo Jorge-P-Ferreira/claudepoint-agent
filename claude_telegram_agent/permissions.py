@@ -55,6 +55,11 @@ _AUTO_ALLOW_TOOLS = {"Read", "Glob", "Grep", "TodoWrite", "BashOutput", "Noteboo
 _AUTO_ALLOW_MODES = {"acceptEdits", "bypassPermissions"}
 _ALWAYS_GATED_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 
+# Fallback when a command arrives without a `permission_mode`, and the mode a session
+# drops back to once its plan is approved — mirrors broker/app/registry.py's
+# DEFAULT_PERMISSION_MODE: never ask before a tool call unless /mode says otherwise.
+DEFAULT_MODE = "bypassPermissions"
+
 # tool_use_id -> the decision_answer's `answer` payload (shared/commands.md shape),
 # recorded by session_manager right before it reconnects to resume a deferred call.
 _pending_answers: dict[str, dict[str, Any]] = {}

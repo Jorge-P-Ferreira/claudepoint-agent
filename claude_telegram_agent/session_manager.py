@@ -88,7 +88,7 @@ class SessionManager:
 
     async def _new_session(self, session_id: str, data: dict[str, Any]) -> None:
         cwd = data["cwd"]
-        mode = data.get("permission_mode", "default")
+        mode = data.get("permission_mode", permissions.DEFAULT_MODE)
         # Set only when the broker is resuming this session after a laptop
         # reconnect/restart (`ws_hub.py::_handle_hello`, `docs/session-model.md` §
         # Resume) — absent, and so `None`, for a normal `/new`.
@@ -184,7 +184,7 @@ class SessionManager:
             self.sessions[session_id] = session
             events.reset(session_id)  # fresh turn-bubble state for the resumed session
 
-        mode = data.get("permission_mode", "default")
+        mode = data.get("permission_mode", permissions.DEFAULT_MODE)
         if answer.get("kind") == "plan_approval" and answer.get("choice") == "approve":
             # Per the Agent SDK's own permission-evaluation rules, `plan` mode routes
             # every file-edit/shell-write tool through the approval callback regardless
@@ -192,7 +192,7 @@ class SessionManager:
             # exit plan mode. Without switching modes here, "Approve & run" would loop
             # Claude straight back into proposing another plan, since it can never act
             # on the one just approved (confirmed live, 2026-09-16).
-            mode = "default"
+            mode = permissions.DEFAULT_MODE
 
         hook = permissions.make_pre_tool_use_hook(self._emit, session_id)
         await session.connect(
@@ -266,7 +266,7 @@ class SessionManager:
         hook = permissions.make_pre_tool_use_hook(self._emit, session_id)
         await session.connect(
             cwd=data["cwd"],
-            mode=data.get("permission_mode", "default"),
+            mode=data.get("permission_mode", permissions.DEFAULT_MODE),
             pre_tool_use_hook=hook,
             can_use_tool=permissions.can_use_tool,
         )

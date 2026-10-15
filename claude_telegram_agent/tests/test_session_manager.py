@@ -113,7 +113,9 @@ async def test_decision_answer_approving_a_plan_switches_out_of_plan_mode(
     )
     await asyncio.sleep(0)
 
-    assert live.connect_calls == [{"cwd": "/proj", "mode": "default", "resume": "claude-abc"}]
+    assert live.connect_calls == [
+        {"cwd": "/proj", "mode": "bypassPermissions", "resume": "claude-abc"}
+    ]
 
 
 async def test_decision_answer_keeping_a_plan_stays_in_plan_mode(
@@ -168,11 +170,11 @@ async def test_decision_answer_reconnects_a_dead_session(monkeypatch: pytest.Mon
 
     assert reset_calls == ["sess2"]
     assert len(created) == 1
-    # mode is "default", not the deferred "plan" — approving a plan must exit plan mode
+    # mode is the no-prompt default, not the deferred "plan" — approving a plan exits plan mode
     # (test_decision_answer_approving_a_plan_switches_out_of_plan_mode covers this
     # directly; this test's real subject is the dead-session reconnect path).
     assert created[0].connect_calls == [
-        {"cwd": "/proj2", "mode": "default", "resume": "claude-def"}
+        {"cwd": "/proj2", "mode": "bypassPermissions", "resume": "claude-def"}
     ]
     assert manager.sessions["sess2"] is created[0]
 
@@ -332,7 +334,9 @@ async def test_new_session_without_claude_session_id_does_not_resume(
         {"session_id": "sess-fresh", "data": {"type": "new_session", "cwd": "/root/proj"}}
     )
 
-    assert created[0].connect_calls == [{"cwd": "/root/proj", "mode": "default", "resume": None}]
+    assert created[0].connect_calls == [
+        {"cwd": "/root/proj", "mode": "bypassPermissions", "resume": None}
+    ]
 
 
 async def test_new_session_registers_can_use_tool_to_unlock_ask_user_question(
