@@ -398,3 +398,51 @@ async def test_dispatch_cmd_isolates_a_failure_and_still_acks() -> None:
     assert len(ws.sent) == 1  # the ack still went out despite the failure
     assert json.loads(ws.sent[0])["kind"] == "ack"
     assert json.loads(ws.sent[0])["data"] == {"ref": "f1"}
+
+
+class _ClosingSocket:
+    """A socket the broker closes before `welcome` — what an unpaired laptop gets."""
+
+    def __init__(self, code: int) -> None:
+        self.code = code
+
+    async def __aenter__(self) -> _ClosingSocket:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def recv(self) -> str:
+        from websockets.frames import Close
+
+        raise websockets.exceptions.ConnectionClosedError(Close(self.code, ""), None)
+
+
+@pytest.mark.parametrize(("code", "expected"), [(4401, daemon.LaptopUnpaired), (1011, None)])
+async def test_run_once_flags_a_4401_before_welcome_as_unpaired(
+    monkeypatch: pytest.MonkeyPatch, code: int, expected: type[Exception] | None
+) -> None:
+    monkeypatch.setattr(daemon.websockets, "connect", lambda *a, **kw: _ClosingSocket(code))
+    config = {"broker_url": "ws://localhost", "laptop_token": "t"}
+
+    if expected is None:  # any other close stays a retryable drop
+        with pytest.raises(websockets.exceptions.ConnectionClosed):
+            await daemon._run_once(config, None, daemon._Connection())  # type: ignore[arg-type]
+    else:
+        with pytest.raises(expected):
+            await daemon._run_once(config, None, daemon._Connection())  # type: ignore[arg-type]
+
+
+async def test_run_stops_retrying_once_unpaired(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    async def fake_run_once(config, manager, conn) -> None:
+        nonlocal calls
+        calls += 1
+        raise daemon.LaptopUnpaired
+
+    monkeypatch.setattr(daemon, "_run_once", fake_run_once)
+
+    with pytest.raises(daemon.LaptopUnpaired):
+        await daemon.run({"broker_url": "ws://localhost", "laptop_token": "t"})
+    assert calls == 1

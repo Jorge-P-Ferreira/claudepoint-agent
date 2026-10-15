@@ -37,6 +37,13 @@ repeatedly closing the socket "cleanly" was reconnecting instantly with zero bac
 every time, hammering the broker and re-triggering its offline/online notification on
 every cycle. The reset now depends on `_STABLE_CONNECTION_SECONDS` of actual uptime,
 judged the same way whether `_run_once` raised or returned cleanly.
+
+Unpaired from the phone: the broker no longer knows this laptop's token, so it closes
+the socket with `4401` before ever sending `welcome`. That's permanent, not a blip —
+`_run_once` raises `LaptopUnpaired` instead of letting the loop retry forever, and
+`run()` lets it propagate (`__main__._cmd_run` then removes the local config and the
+background service). A `4401` *after* `welcome` (the broker's hello timeout) is still
+just a retryable drop.
 """
 
 from __future__ import annotations
@@ -56,6 +63,11 @@ from . import __version__, projects
 from .session_manager import SessionManager
 
 HEARTBEAT_INTERVAL_SECONDS = 20
+_UNAUTHORIZED_CLOSE_CODE = 4401
+
+
+class LaptopUnpaired(Exception):
+    """The broker rejected this laptop's token — it was unpaired (or never paired)."""
 
 # 1 -> 2 -> 5 -> 15 -> 30s, then holds at 30s. Real network drops (a laptop asleep,
 # a flaky WiFi AP) can last anywhere from a second to tens of minutes; this backs off
@@ -171,7 +183,12 @@ async def _run_once(config: dict[str, Any], manager: SessionManager, conn: _Conn
         conn.ws = ws
         seen_ids: set[str] = set()
 
-        await ws.recv()  # `welcome` — nothing to act on in Phase 1
+        try:
+            await ws.recv()  # `welcome` — nothing to act on in Phase 1
+        except websockets.exceptions.ConnectionClosed as exc:
+            if exc.rcvd is not None and exc.rcvd.code == _UNAUTHORIZED_CLOSE_CODE:
+                raise LaptopUnpaired from exc
+            raise
 
         await ws.send(
             json.dumps(

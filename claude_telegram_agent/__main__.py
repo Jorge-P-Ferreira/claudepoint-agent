@@ -24,8 +24,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         stream = log_file.open("a", encoding="utf-8", buffering=1)
         sys.stdout = sys.stderr = stream
-    cfg = config.load_config()
-    asyncio.run(daemon.run(cfg))
+    try:
+        cfg = config.load_config()
+    except FileNotFoundError:
+        print("not paired — nothing to run (pair again with /pair on the phone)")
+        return 0
+    try:
+        asyncio.run(daemon.run(cfg))
+    except daemon.LaptopUnpaired:
+        # Unpaired from the phone: the token is dead for good, so stop instead of
+        # retrying forever. The service goes last — on macOS/Linux removing it stops
+        # this very process.
+        print("this laptop was unpaired on the phone — removing local config and service")
+        config.delete_config()
+        print(service.uninstall())
     return 0
 
 

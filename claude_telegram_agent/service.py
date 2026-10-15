@@ -182,17 +182,21 @@ def install() -> str:
 
 
 def uninstall() -> str:
+    # Files/registrations are removed *before* the stop call: the agent also runs this
+    # on itself after being unpaired (`__main__._cmd_run`), and stopping the job kills
+    # this process — anything ordered after the stop would never run.
     if sys.platform == "darwin":
-        _run(["launchctl", "bootout", f"{_launchd_domain()}/{LABEL}"], check=False)
         _launchd_plist().unlink(missing_ok=True)
+        _run(["launchctl", "bootout", f"{_launchd_domain()}/{LABEL}"], check=False)
         return f"Removed {LABEL}."
     if sys.platform == "win32":
-        _run(["schtasks", "/End", "/TN", WINDOWS_TASK], check=False)
         _run(["schtasks", "/Delete", "/TN", WINDOWS_TASK, "/F"], check=False)
+        _run(["schtasks", "/End", "/TN", WINDOWS_TASK], check=False)
         return f"Removed scheduled task '{WINDOWS_TASK}'."
-    _run(["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT], check=False)
+    _run(["systemctl", "--user", "disable", SYSTEMD_UNIT], check=False)
     _systemd_unit_path().unlink(missing_ok=True)
     _run(["systemctl", "--user", "daemon-reload"], check=False)
+    _run(["systemctl", "--user", "stop", SYSTEMD_UNIT], check=False)
     return f"Removed {SYSTEMD_UNIT}."
 
 
