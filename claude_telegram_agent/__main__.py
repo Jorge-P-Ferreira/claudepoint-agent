@@ -35,9 +35,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # Unpaired from the phone: the token is dead for good, so stop instead of
         # retrying forever. The service goes last — on macOS/Linux removing it stops
         # this very process.
-        print("this laptop was unpaired on the phone — removing local config and service")
+        # flush: removing the service kills this process before buffered output lands.
+        print(
+            "this laptop was unpaired on the phone — removing local config and service",
+            flush=True,
+        )
         config.delete_config()
-        print(service.uninstall())
+        print(service.uninstall(), flush=True)
     return 0
 
 
