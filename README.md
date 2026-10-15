@@ -36,7 +36,7 @@ it). The pairing code works once and expires after 10 minutes.
 
 | Command | Action |
 |---|---|
-| `claude-telegram-agent pair <code> --broker <url> [--project-roots a,b]` | one-time pairing; writes config |
+| `claude-telegram-agent pair <code> --broker <url> [--project-roots a,b]` | one-time pairing; writes config. Roots default to `~/Projects`, created if missing |
 | `claude-telegram-agent run [--log-file f]` | run the daemon in the foreground |
 | `claude-telegram-agent service install` / `uninstall` | start at login and restart on crash, or remove that |
 | `claude-telegram-agent status` | print config, broker URL, discovered projects |

@@ -12,6 +12,10 @@ from . import config, daemon, pairing, projects, service
 
 def _cmd_pair(args: argparse.Namespace) -> int:
     project_roots = [p.strip() for p in args.project_roots.split(",") if p.strip()]
+    # The bot's walkthrough tells users their projects live in ~/Projects; make sure
+    # the folder is there whichever way they paired (the bootstrap scripts do too).
+    for root in project_roots:
+        Path(root).expanduser().mkdir(parents=True, exist_ok=True)
     pairing.pair(args.code, args.broker, project_roots=project_roots, default_mode=args.mode)
     return 0
 
@@ -81,8 +85,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_pair.add_argument("--broker", required=True, help="broker base URL, e.g. https://broker.example.com")
     p_pair.add_argument(
         "--project-roots",
-        default=".",
-        help="comma-separated directories to expose as projects (default: cwd)",
+        default=str(Path.home() / "Projects"),
+        help="comma-separated directories to expose as projects (default: ~/Projects)",
     )
     p_pair.add_argument(
         "--mode",
