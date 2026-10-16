@@ -44,6 +44,13 @@ the socket with `4401` before ever sending `welcome`. That's permanent, not a bl
 `run()` lets it propagate (`__main__._cmd_run` then removes the local config and the
 background service). A `4401` *after* `welcome` (the broker's hello timeout) is still
 just a retryable drop.
+
+A broker that's restarting (a deploy) answers the WebSocket handshake with an HTTP error
+— Caddy's 502 while the container is down. `websockets` raises that as
+`InvalidHandshake` (`InvalidStatus`), which is neither `ConnectionClosed` nor `OSError`,
+so it used to escape `run()` and kill the process. On Windows that's permanent until
+the next logon (Task Scheduler's restart-on-failure doesn't fire for a process that
+exits non-zero). It's now retried with backoff like any other drop.
 """
 
 from __future__ import annotations
@@ -145,7 +152,11 @@ async def run(config: dict[str, Any]) -> None:
             exc: Exception | None = None
             try:
                 await _run_once(config, manager, conn)
-            except (websockets.exceptions.ConnectionClosed, OSError) as caught:
+            except (
+                websockets.exceptions.ConnectionClosed,
+                websockets.exceptions.InvalidHandshake,
+                OSError,
+            ) as caught:
                 exc = caught
 
             # Judge by how long the connection actually stayed up, not by whether

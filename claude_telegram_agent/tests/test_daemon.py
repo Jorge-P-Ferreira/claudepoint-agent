@@ -68,6 +68,30 @@ async def test_run_reconnects_after_os_error(monkeypatch: pytest.MonkeyPatch) ->
     assert calls == 2
 
 
+async def test_run_reconnects_after_a_502_handshake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deploy restarting the broker makes the proxy answer the handshake with a 502 —
+    retried with backoff, not a crash (it used to escape `run()` and kill the agent)."""
+    from websockets.datastructures import Headers
+    from websockets.http11 import Response
+
+    calls = 0
+
+    async def fake_run_once(config, manager, conn) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise websockets.exceptions.InvalidStatus(Response(502, "Bad Gateway", Headers()))
+        raise SystemExit
+
+    monkeypatch.setattr(daemon, "_run_once", fake_run_once)
+    monkeypatch.setattr(daemon, "_backoff_delay", lambda attempt: 0)
+
+    with pytest.raises(SystemExit):
+        await daemon.run({"broker_url": "ws://localhost", "laptop_token": "t"})
+
+    assert calls == 2
+
+
 async def test_run_backs_off_on_a_fast_clean_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     """A `_run_once` that returns *without raising* (the `websockets` client's receive
     loop exits this way on a normal server-side close, e.g. an idle-timeout proxy —
