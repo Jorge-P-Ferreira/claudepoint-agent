@@ -155,14 +155,26 @@ async def test_plan_approval_approve_allows_keep_denies() -> None:
     assert kept["hookSpecificOutput"]["permissionDecisionReason"] == "add more detail"
 
 
-@pytest.mark.parametrize("mode", ["acceptEdits", "bypassPermissions"])
-async def test_permissive_modes_skip_ordinary_tools(mode: str) -> None:
+@pytest.mark.parametrize("mode", ["acceptEdits", "bypassPermissions", "plan"])
+@pytest.mark.parametrize("tool", ["Bash", "Write", "Agent", "ToolSearch"])
+async def test_permissive_modes_skip_ordinary_tools(mode: str, tool: str) -> None:
+    """Only `/mode default` asks — `plan` included here: a live taskpoint session in
+    `plan` sent a card for every Agent/Bash/Write/ToolSearch call (2026-10-22)."""
     emit = _Emitted()
     result = await _hook(emit)(
-        {"tool_name": "Bash", "tool_input": {}, "permission_mode": mode}, "tu10", None
+        {"tool_name": tool, "tool_input": {}, "permission_mode": mode}, "tu10", None
     )
     assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert emit.calls == []
+
+
+async def test_default_mode_asks_before_an_ordinary_tool() -> None:
+    emit = _Emitted()
+    result = await _hook(emit)(
+        {"tool_name": "Bash", "tool_input": {}, "permission_mode": "default"}, "tu10d", None
+    )
+    assert result["hookSpecificOutput"]["permissionDecision"] == "defer"
+    assert len(emit.calls) == 1
 
 
 async def test_can_use_tool_fallback_denies_defensively() -> None:
@@ -177,7 +189,7 @@ async def test_can_use_tool_fallback_denies_defensively() -> None:
     assert isinstance(result, PermissionResultDeny)
 
 
-@pytest.mark.parametrize("mode", ["acceptEdits", "bypassPermissions"])
+@pytest.mark.parametrize("mode", ["acceptEdits", "bypassPermissions", "plan"])
 async def test_permissive_modes_still_gate_ask_user_question(mode: str) -> None:
     emit = _Emitted()
     result = await _hook(emit)(

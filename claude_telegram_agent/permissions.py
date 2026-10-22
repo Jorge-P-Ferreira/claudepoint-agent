@@ -1,6 +1,7 @@
 """Bridge the SDK permission flow to Telegram decisions. Mapping: ../../docs/claude-driver.md.
 
-Phase 2: every tool call not on the auto-allow list is parked via a `PreToolUse`
+Phase 2: in `default` mode (the only mode that asks — see `_ASKING_MODES`), every tool
+call not on the auto-allow list is parked via a `PreToolUse`
 `defer` hook rather than blocked on in-process `can_use_tool` — the phone might not
 answer for hours, and deferring lets the SDK end the turn (the process can even exit)
 instead of sitting blocked (`docs/claude-driver.md` § "Deferring a decision").
@@ -50,9 +51,12 @@ EmitFn = Callable[[str | None, dict[str, Any]], Awaitable[None]]
 # Read-only / non-mutating tools never prompt — matches the intent of
 # ClaudeAgentOptions(permission_mode="default") without pestering for every Read.
 _AUTO_ALLOW_TOOLS = {"Read", "Glob", "Grep", "TodoWrite", "BashOutput", "NotebookRead"}
-# acceptEdits/bypassPermissions short-circuit everything except the two decision-shaped
-# tools, which always need a human regardless of mode.
-_AUTO_ALLOW_MODES = {"acceptEdits", "bypassPermissions"}
+# Only `default` mode asks before a tool call — the user opts a session into that with
+# /mode. Every other mode (`plan` too: it explores freely, and Claude's own plan-mode
+# instructions keep it from editing) runs tools unasked, except the two decision-shaped
+# tools, which always need a human regardless of mode. A hook input with no mode at all
+# is treated as asking, failing closed.
+_ASKING_MODES = {"default", None}
 _ALWAYS_GATED_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 
 # Fallback when a command arrives without a `permission_mode`, and the mode a session
@@ -105,7 +109,7 @@ def make_pre_tool_use_hook(emit: EmitFn, session_id: str) -> HookMatcher:
 
         if tool_name not in _ALWAYS_GATED_TOOLS and (
             tool_name in _AUTO_ALLOW_TOOLS
-            or mode in _AUTO_ALLOW_MODES
+            or mode not in _ASKING_MODES
             or tool_name in _session_always_allowed.get(session_id, ())
         ):
             return _allow()
